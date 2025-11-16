@@ -1,0 +1,27 @@
+# AWS 클라우드 포메이션 템플릿 버전
+AWSTemplateFormatVersion: '2010-09-09'
+# 이 템플릿이 SAM(Serverless Application Model)을 사용함을 선언
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Telegram chat summarization bot using AWS Lambda and Gemini API.
+
+# 이 섹션에서 AWS 자원(리소스)들을 정의.
+Resources:
+
+  # 1. Lambda 함수 정의.
+  SummarizerFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: src/                  # 1. Lambda 코드(app.py)가 있는 폴더
+      Handler: app.lambda_handler    # 2. 실행할 파일(app)과 "함수"(lambda_handler)
+      Runtime: python3.10            # 3. Poetry에서 설정한 파이썬 버전과 일치시키기.
+      Architectures:
+        - x86_64
+
+      # 2. API Gateway를 정의하고 Lambda와 연결.
+      Events:
+        ApiEvent:
+          Type: Api # "API Gateway"를 만들라는 의미.
+          Properties:
+            Path: /bot   # 봇의 URL 주소 (예: .../prod/bot)
+            Method: post # 텔레그램이 POST 방식으로만 호출하도록 설정
