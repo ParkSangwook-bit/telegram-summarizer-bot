@@ -2,13 +2,13 @@
 name = "telegram-summarizer-bot"
 version = "0.1.0"
 description = "Telegram chat summarization bot using AWS Lambda and Gemini API"
-authors = [
-    {name = "PSW",email = "qkrtkddnr0118@gmail.com"}
-]
 license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "python-telegram-bot (>=22.5,<23.0)",   # 텔레그램 봇을 위한 라이브러리
+    "google-generativeai (>=0.8.5,<0.9.0)",  # Gemini API를 위한 라이브러리
+    "boto3 (>=1.40.74,<2.0.0)"  # AWS SDK를 위한 라이브러리. 원래 자동으로 설치되지만, 명시적으로 표기
 ]
 
 [tool.poetry]

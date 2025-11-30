@@ -1,27 +1,92 @@
-# AWS 클라우드 포메이션 템플릿 버전
 AWSTemplateFormatVersion: '2010-09-09'
-# 이 템플릿이 SAM(Serverless Application Model)을 사용함을 선언
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  Telegram chat summarization bot using AWS Lambda and Gemini API.
+  (v2.1) Telegram chat summarization bot with DynamoDB memory and Explicit API.
 
-# 이 섹션에서 AWS 자원(리소스)들을 정의.
+# ===================================================================
+# 파라미터 정의
+# ===================================================================
+Parameters:
+  TelegramTokenParameter:
+    Type: String
+    NoEcho: true # 텔레그램 토큰이 노출되지 않도록 설정
+  GeminiApiKeyParameter:
+    Type: String
+    NoEcho: true # Gemini API 키가 노출되지 않도록 설정
+
+# ===================================================================
+# AWS 자원 정의
+# ===================================================================
 Resources:
 
-  # 1. Lambda 함수 정의.
+  # API Gateway 명시적 정의
+  SummarizerApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod # 'Prod' 스테이지
+      Auth:
+        DefaultAuthorizer: NONE
+      # CORS 설정 (테스트에 유용함)
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"  
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: "'*'"
+
+  # 람다 함수
   SummarizerFunction:
     Type: AWS::Serverless::Function 
     Properties:
-      CodeUri: src/                  # 1. Lambda 코드(app.py)가 있는 폴더
-      Handler: app.lambda_handler    # 2. 실행할 파일(app)과 "함수"(lambda_handler)
-      Runtime: python3.10            # 3. Poetry에서 설정한 파이썬 버전과 일치시키기.
+      CodeUri: src/
+      Handler: app.lambda_handler # 핵심 핸들러
+      Runtime: python3.10
+      Timeout: 30 # 30초 타임아웃 설정
+      MemorySize: 512 # 512MB 메모리 할당
       Architectures:
         - x86_64
-
-      # 2. API Gateway를 정의하고 Lambda와 연결.
+      Environment:
+        Variables:
+          # 직접 cli에서 입력하는 것으로 유출 방지
+          TELEGRAM_TOKEN: !Ref TelegramTokenParameter
+          GEMINI_API_KEY: !Ref GeminiApiKeyParameter
+          DYNAMO_TABLE_NAME: !Ref ChatLogsTable 
+      
       Events:
         ApiEvent:
-          Type: Api # "API Gateway"를 만들라는 의미.
+          Type: Api
           Properties:
-            Path: /bot   # 봇의 URL 주소 (예: .../prod/bot)
-            Method: post # 텔레그램이 POST 방식으로만 호출하도록 설정
+            Path: /bot
+            Method: post
+            # "암시적" API ->"명시적" API로 변경
+            RestApiId: !Ref SummarizerApi
+
+      # 함수 DynamoDB 테이블 접근 권한 부여.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChatLogsTable 
+
+  # DynamoDB 테이블
+  ChatLogsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "chat_id"
+          AttributeType: "S"
+        - AttributeName: "timestamp"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "chat_id"
+          KeyType: "HASH"
+        - AttributeName: "timestamp"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: "ttl"
+        Enabled: true
+
+# ===================================================================
+# 출력
+# ===================================================================
+Outputs:
+  SummarizerFunctionApi:
+    Description: "API Gateway endpoint URL for Prod stage"
+    Value: !Sub "https://${SummarizerApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/bot"
