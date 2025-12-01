@@ -66,7 +66,7 @@ graph LR
     - 네트워크 지연이나 AI 처리 시간 초과로 인해 텔레그램 서버가 요청을 재전송(Retry)하는 경우, 중복 응답이 발생할 수 있습니다.
     - 이를 방지하기 위해 **DynamoDB의 조건부 쓰기(Conditional Write)** 를 활용하여, 이미 처리 중인 `update_id`가 들어오면 작업을 수행하지 않고 즉시 종료하는 로직을 구현했습니다.
 - **비동기 파이프라인 최적화**:
-    - AWS Lambda의 동기적 핸들러(Sync)와 Python 라이브러리의 비동기(Async) 특성을 효율적으로 연결하기 위해 `asyncio` 브릿지 패턴을 적용했습니다.
+    - AWS Lambda의 동기적 핸들러(Sync)와 Python 라이브러리의 비동기(Async) 특성을 효율적으로 연결하기 위해 `asyncio` 이벤트 루프 관리를 적용했습니다.
     - 봇 객체의 세션 수명 주기를 명확히 관리하여 `Event loop is closed`와 같은 런타임 오류를 방지했습니다.
 
 
@@ -111,4 +111,4 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_UR
 
 ## 📅 로드맵 (Roadmap)
 - [x] v1.0: 기본 요약 기능 및 DB 연동 완료
-- [ ] _기능 추가 검토중_
+- [x] v1.1.0: 마이너 리팩토링(저장과 요약에서의 중복 방지 로직 추가, ai 프롬프트 방식 개선)
