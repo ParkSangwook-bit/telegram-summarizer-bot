@@ -209,3 +209,4 @@ __marimo__/
 # AWS SAM build artifacts
 .aws-sam/
 samconfig.toml
+benchmark_config.py
