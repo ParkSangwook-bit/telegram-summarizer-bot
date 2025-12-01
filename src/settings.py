@@ -1,5 +1,5 @@
 import os
-
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 # =============================================
 # 쓸 곳이 없어서 잠깐 적음
 GITHUB_URL = "https://github.com/ParkSangwook-bit/telegram-summarizer-bot"
@@ -24,10 +24,10 @@ class AIConfig:
     }
     
     SAFETY_SETTINGS = {
-        'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
-        'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
-        'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'BLOCK_NONE',
-        'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
     }
 
 # XML
