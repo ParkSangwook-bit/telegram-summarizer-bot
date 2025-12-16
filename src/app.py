@@ -161,11 +161,11 @@ def format_messages_to_xml(messages):
 # ===============================================================
 
 async def handle_summary(update, context):
-    """ /summary 명령어 처리 """
+    """ /sum 명령어 처리 """
     chat_id = update.effective_chat.id
     text = update.effective_message.text
     
-    # 숫자 파싱 (/summary 50)
+    # 숫자 파싱 (/sum 50)
     limit = 100
     parts = text.split()
     if len(parts) > 1 and parts[1].isdigit():
@@ -189,15 +189,34 @@ async def handle_summary(update, context):
     try:
         final_input_prompt = f"{settings.PromptConfig.SYSTEM_TEMPLATE}\n{xml_data}"
         
+        # AI에게 요약 생성 요청
         response = model.generate_content(
             final_input_prompt,
             generation_config=settings.AIConfig.GENERATION_CONFIG,
             safety_settings=settings.AIConfig.SAFETY_SETTINGS
         )
-        await context.bot.send_message(chat_id=chat_id, text=response.text, parse_mode='Markdown')
+        
+        response_text = response.text
+
+        # 안전장치
+        try:
+            # 마크다운 모드로 전송
+            await context.bot.send_message(
+                chat_id=chat_id, 
+                text=response_text, 
+                parse_mode='Markdown'
+            )
+        except telegram.error.BadRequest:
+            # 마크다운 파싱 에러 발생 시 -> 일반 텍스트로 재전송(전송 성공 보장)
+            await context.bot.send_message(
+                chat_id=chat_id, 
+                text=response_text, 
+                parse_mode=None 
+            )
         
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ 요약 실패: {e}")
+        # AI 생성 실패 or 네트워크 오류 등 기타 치명적 에러
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ 시스템 오류: {e}")
 
 async def handle_about(update, context):
     """ /about 명령어: 봇 정보와 버튼 출력 """
@@ -251,7 +270,7 @@ async def handle_about(update, context):
 
 # 딕셔너리 기반 라우터 설정
 COMMAND_HANDLERS = {
-    "/summary": handle_summary,
+    "/sum": handle_summary,
     "/about": handle_about,
     # "/help": handle_help,
     }
@@ -289,10 +308,10 @@ async def main_logic(event, context):
             # 딕셔너리에 있는 명령어면 실행
 
             if text.startswith("/"):
-                # 공백 기준으로 첫 단어만 가져옴 ("/summary@bot 50" -> "/summary@bot")
+                # 공백 기준으로 첫 단어만 가져옴 ("/sum@bot 50" -> "/sum@bot")
                 first_word = text.split()[0]
                 
-                # @가 붙어있으면 떼버림 ("/summary@bot" -> "/summary")
+                # @가 붙어있으면 떼버림 ("/sum@bot" -> "/sum")
                 command_key = first_word.split('@')[0]
 
 
