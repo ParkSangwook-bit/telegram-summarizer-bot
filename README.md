@@ -68,6 +68,36 @@ graph LR
 - **비동기 파이프라인 최적화**:
     - AWS Lambda의 동기적 핸들러(Sync)와 Python 라이브러리의 비동기(Async) 특성을 효율적으로 연결하기 위해 `asyncio` 이벤트 루프 관리를 적용했습니다.
     - 봇 객체의 세션 수명 주기를 명확히 관리하여 `Event loop is closed`와 같은 런타임 오류를 방지했습니다.
+- **메시지 수정 처리 (Logical Upsert)**:
+    - 텔레그램은 메시지가 수정되면 `edited_message` 이벤트를 새로 보냅니다.
+    - 기존 데이터를 DB에서 찾아 덮어쓰는(Physical Upsert) 방식은 DB 읽기/쓰기 비용이 듭니다.
+    - 그래서 수정된 메시지도 새로운 행으로 저장(Append)하고, 요약 시 Python 메모리 상에서 **`msg_id`를 기준으로 중복을 제거(Deduplication)** 하여 가장 최신 내용만 반영하도록 구현했습니다.
+```mermaid
+sequenceDiagram
+    participant T as Telegram
+    participant L as Lambda
+    participant D as DynamoDB
+    participant G as Gemini
+
+    Note over T, L: 메시지 수정 발생 (사과 -> 바나나)
+    T->>L: Update (edited_message)
+    L->>D: Insert New Row (Key: New Timestamp, Attr: msg_id=123)
+    
+    Note over T, L: 요약 요청 (/summary)
+    T->>L: Request Summary
+    L->>D: Query (Limit 100)
+    D-->>L: Return [Msg(id=123, 사과), Msg(id=123, 바나나)]
+    
+    rect rgb(30, 30, 30)
+        Note right of L: 🛠️ Python 내부 로직
+        L->>L: Dict[msg_id] = Content
+        L->>L: 덮어쓰기 수행 (사과 소멸, 바나나 유지)
+    end
+    
+    L->>G: Optimized Prompt (XML)
+    G-->>L: Structured Summary
+    L->>T: Send Message
+```
 
 
 ## 🚀 설치 및 배포 (Deployment)
@@ -112,3 +142,4 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_UR
 ## 📅 로드맵 (Roadmap)
 - [x] v1.0: 기본 요약 기능 및 DB 연동 완료
 - [x] v1.1.0: 마이너 리팩토링(저장과 요약에서의 중복 방지 로직 추가, ai 프롬프트 방식 개선)
+- [x] v1.1.1: 시스템 프롬프트 개선 및 마이너 업데이트(명령어 수정, 에러 메시지 개선)
