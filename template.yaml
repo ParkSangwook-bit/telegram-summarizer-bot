@@ -38,7 +38,7 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: app.lambda_handler # 핵심 핸들러
-      Runtime: python3.10
+      Runtime: python3.13
       Timeout: 30 # 30초 타임아웃 설정
       MemorySize: 512 # 512MB 메모리 할당
       Architectures:
