@@ -202,31 +202,94 @@ def strip_tags(text):
     """ HTML 전송이 실패했을 때 일반 텍스트로 보내기 위해 허용 태그를 걷어냄 """
     return re.sub(r"</?(b|i|code|blockquote)( expandable)?>", "", text)
 
+def format_duration(duration):
+    """ 텔레그램 duration(초 정수 또는 timedelta)을 "m:ss"로 """
+    seconds = int(duration.total_seconds()) if hasattr(duration, "total_seconds") else int(duration or 0)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+def describe_media(message):
+    """
+    args:
+        message (telegram.Message): 텔레그램 메시지
+    features:
+        글이 없는 메시지(사진·동영상·스티커 등)를 "[사진] 캡션" 같은 표식으로 바꿈 -> 요약 맥락에 포함
+        (파일 내용 자체는 읽지 않음. 해당 없으면 None)
+    """
+    if message.photo:
+        kind = "사진"
+    elif message.animation:  # GIF는 document도 함께 채워지므로 먼저 확인
+        kind = "GIF"
+    elif message.video:
+        kind = f"동영상 {format_duration(message.video.duration)}"
+    elif message.video_note:
+        kind = f"영상 메시지 {format_duration(message.video_note.duration)}"
+    elif message.voice:
+        kind = f"음성 {format_duration(message.voice.duration)}"
+    elif message.audio:
+        kind = f"오디오 {message.audio.title or ''}"
+    elif message.sticker:
+        kind = f"스티커 {message.sticker.emoji or ''}"
+    elif message.document:
+        kind = f"파일 {message.document.file_name or ''}"
+    elif message.poll:
+        options = " / ".join(option.text for option in message.poll.options)
+        kind = f"투표 {message.poll.question} ({options})"
+    elif message.venue:  # venue도 location을 함께 가지므로 먼저 확인
+        kind = f"장소 {message.venue.title}"
+    elif message.location:
+        kind = "위치"
+    elif message.contact:
+        kind = "연락처"
+    elif message.dice:
+        kind = f"주사위 {message.dice.emoji} {message.dice.value}"
+    else:
+        return None
+
+    tag = f"[{kind.strip()}]"
+    return f"{tag} {message.caption}" if message.caption else tag
+
 # ===============================================================
 # 핸들러 함수 (Command Handlers)
 # ===============================================================
 
+# 요약 아래 [최근 N개로 다시] 버튼에 쓸 개수 (이슈 #2: 숫자 입력 대신 버튼)
+MORE_LIMITS = (200, 500)
+MAX_LIMIT = 500
+
+def more_buttons(limit):
+    """ 지금보다 큰 개수만 버튼으로. 더 키울 게 없으면 None """
+    buttons = [InlineKeyboardButton(f"최근 {n}개로 다시", callback_data=f"sum:{n}") for n in MORE_LIMITS if n > limit]
+    return InlineKeyboardMarkup([buttons]) if buttons else None
+
 async def handle_summary(update, context):
     """ /sum 명령어 처리 """
-    chat_id = update.effective_chat.id
-    text = update.effective_message.text
-    
     # 숫자 파싱 (/sum 50)
     limit = 100
-    parts = text.split()
+    parts = update.effective_message.text.split()
     if len(parts) > 1 and parts[1].isdigit():
-        limit = int(parts[1])
-        # 안전장치
-        if limit > 500: limit = 500
-    
+        limit = min(int(parts[1]), MAX_LIMIT)  # 안전장치
+
+    await send_summary(context.bot, update.effective_chat.id, limit)
+
+async def handle_more_button(update, bot):
+    """ 요약 아래 [최근 N개로 다시] 버튼 처리 """
+    query = update.callback_query
+    await query.answer()  # 버튼의 로딩 표시를 끔
+
+    data = query.data or ""
+    if data.startswith("sum:") and data[4:].isdigit():
+        await send_summary(bot, query.message.chat.id, min(int(data[4:]), MAX_LIMIT))
+
+async def send_summary(bot, chat_id, limit):
+    """ 최근 limit개를 요약해 보냄 (명령어와 버튼이 함께 씀) """
     #TODO: 나중에 입력중으로 변경(입력중 + 안내 메시지)
-    await context.bot.send_message(chat_id=chat_id, text=f"🤖 최근 {limit}개의 대화 내용을 읽고 있어요...")
-    
+    await bot.send_message(chat_id=chat_id, text=f"🤖 최근 {limit}개의 대화 내용을 읽고 있어요...")
+
     # DB 조회 -> 중복 제거 -> XML 변환
     chat_history = get_clean_chat_history(chat_id, limit)
-    
+
     if not chat_history:
-        await context.bot.send_message(chat_id=chat_id, text="요약할 대화 내용이 없습니다.")
+        await bot.send_message(chat_id=chat_id, text="요약할 대화 내용이 없습니다.")
         return
 
     xml_data = format_messages_to_xml(chat_history)
@@ -245,44 +308,49 @@ async def handle_summary(update, context):
 
         # 안전 필터 등으로 본문이 비어 오는 경우
         if not response_text:
-            await context.bot.send_message(chat_id=chat_id, text="❌ 요약을 만들지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
+            await bot.send_message(chat_id=chat_id, text="❌ 요약을 만들지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
             return
 
         header = format_header(chat_history)
+        reply_markup = more_buttons(limit)
 
         # 안전장치
         try:
             # HTML 모드로 전송
-            await context.bot.send_message(
+            await bot.send_message(
                 chat_id=chat_id,
                 text=f"{html.escape(header)}\n\n{to_telegram_html(response_text)}",
-                parse_mode='HTML'
+                parse_mode='HTML',
+                reply_markup=reply_markup,
             )
         except telegram.error.BadRequest:
             # HTML 파싱 에러 발생 시 -> 태그를 걷어낸 일반 텍스트로 재전송(전송 성공 보장)
-            await context.bot.send_message(
+            await bot.send_message(
                 chat_id=chat_id,
                 text=f"{header}\n\n{strip_tags(response_text)}",
-                parse_mode=None
+                parse_mode=None,
+                reply_markup=reply_markup,
             )
-        
+
     except Exception as e:
         # AI 생성 실패 or 네트워크 오류 등 기타 치명적 에러
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ 시스템 오류: {e}")
+        await bot.send_message(chat_id=chat_id, text=f"❌ 시스템 오류: {e}")
 
 async def handle_about(update, context):
     """ /about 명령어: 봇 정보와 버튼 출력 """
     chat_id = update.effective_chat.id
 
     about_text = (
-        f"🤖 **Telegram Summary Bot** ({settings.BOT_VERSION})\n\n"
-        "바쁜 당신을 위해 대화 내용을 놓치지 않도록 \n"
-        "**AI(Gemini)**가 핵심만 쏙쏙 요약해 드립니다.\n\n"
-        f"**현재 AI모델**: {settings.AIConfig.MODEL_NAME}\n"
-        "✨ **주요 기능**\n"
-        "- `/summary`: 최근 대화 요약\n"
-        "- 대화 자동 저장 및 만료 처리 (TTL)\n\n"
-        f"📅 **마지막 업데이트:** {settings.LAST_UPDATE}"
+        f"🤖 <b>Telegram Summary Bot</b> ({settings.BOT_VERSION})\n\n"
+        "바쁜 당신을 위해 대화 내용을 놓치지 않도록\n"
+        "<b>AI(Gemini)</b>가 핵심만 쏙쏙 요약해 드립니다.\n\n"
+        f"<b>현재 AI모델</b>: {settings.AIConfig.MODEL_NAME}\n"
+        "✨ <b>주요 기능</b>\n"
+        "- <code>/sum</code>: 최근 100개 대화 요약 (<code>/sum 200</code>처럼 개수 지정, 최대 500)\n"
+        "- 요약 아래 버튼으로 더 많은 대화를 다시 요약\n"
+        "- 사진·동영상·파일은 표식과 캡션으로 요약에 포함\n"
+        "- 대화 자동 저장 및 7일 뒤 삭제 (TTL)\n\n"
+        f"📅 <b>마지막 업데이트:</b> {settings.LAST_UPDATE}"
     )
 
     keyboard = [
@@ -297,7 +365,7 @@ async def handle_about(update, context):
         await context.bot.send_message(
             chat_id=chat_id,
             text=about_text,
-            parse_mode='Markdown',
+            parse_mode='HTML',
             reply_markup=reply_markup,
             disable_web_page_preview=True # 링크 미리보기 끄기
     )
@@ -323,6 +391,7 @@ async def handle_about(update, context):
 # 딕셔너리 기반 라우터 설정
 COMMAND_HANDLERS = {
     "/sum": handle_summary,
+    "/summary": handle_summary,  # 예전 안내 문구(/summary)로 들어오는 경우
     "/about": handle_about,
     # "/help": handle_help,
     }
@@ -340,14 +409,23 @@ async def main_logic(event, context):
                 print(f"Duplicate request ignored: {update.update_id}")
                 return {"statusCode": 200, "body": "Duplicate ignored"}
 
-            if not update.effective_message or not update.effective_message.text:
-                return {"statusCode": 200, "body": "No text message"}
+            # 요약 아래 버튼을 누른 경우 (메시지가 아니므로 저장하지 않음)
+            if update.callback_query:
+                await handle_more_button(update, bot)
+                return {"statusCode": 200, "body": "OK"}
 
             message = update.effective_message
+            if not message:
+                return {"statusCode": 200, "body": "No message"}
+
+            # 글이 없는 메시지(사진·동영상·스티커 등)는 "[사진] 캡션" 같은 표식으로 저장
+            text = message.text or describe_media(message)
+            if not text:
+                return {"statusCode": 200, "body": "No text message"}
+
             chat_id = message.chat.id
-            text = message.text
             user = message.from_user
-            
+
             if user and user.is_bot:
                 return {"statusCode": 200, "body": "Bot ignored"}
 
@@ -384,7 +462,8 @@ async def main_logic(event, context):
                 save_message_to_db(
                     chat_id=chat_id,
                     message_id=message.message_id,
-                    user_name=user.first_name,
+                    # 익명 관리자·채널 글은 from_user가 없으므로 보낸 채팅 이름으로 대신함
+                    user_name=user.first_name if user else (message.sender_chat.title if message.sender_chat else "알 수 없음"),
                     text=text,
                     message_date=message.date
                 )

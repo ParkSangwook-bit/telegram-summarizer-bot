@@ -17,7 +17,9 @@ _[작동 영상 추가 예정]_
 ## ✨ 주요 기능 (Features)
 
 - 실시간 대화 저장: 텔레그램의 웹훅을 통해 대화내용이 안전하게 저장됩니다. 저장된 메시지는 7일뒤에 자동으로 삭제됩니다.(TTL)
-- AI 요약: /명령으로, 최근 대화 내용을 Google의 인공지능, Gemini가 분석하여 요약합니다.
+- AI 요약: `/sum`(기본 100개, `/sum 200`처럼 개수 지정, 최대 500)으로 최근 대화를 Gemini가 한 줄 + 접힌 상세로 요약합니다.
+- 다시 요약 버튼: 요약 아래 [최근 200개로 다시] [최근 500개로 다시] 버튼으로 숫자를 치지 않고 범위를 넓힙니다.
+- 미디어 표식: 사진·동영상·음성·스티커·파일·투표는 `[사진] 캡션` 같은 표식으로 저장되어 요약 맥락에 들어갑니다.
 - UI/UX: 대기 메시지 및 에러 발생 시 사용자 알림 기능을 제공함.
 - AWS Lambda의 서버리스 프리티어와 gemini api를 통해서 유지비용 최소화
 
@@ -83,7 +85,7 @@ sequenceDiagram
     T->>L: Update (edited_message)
     L->>D: Insert New Row (Key: New Timestamp, Attr: msg_id=123)
     
-    Note over T, L: 요약 요청 (/summary)
+    Note over T, L: 요약 요청 (/sum)
     T->>L: Request Summary
     L->>D: Query (Limit 100)
     D-->>L: Return [Msg(id=123, 사과), Msg(id=123, 바나나)]
@@ -145,3 +147,4 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_UR
 - [x] v1.1.1: 시스템 프롬프트 개선 및 마이너 업데이트(명령어 수정, 에러 메시지 개선)
 - [x] v1.1.2: 요약 전송 시 HTML 이스케이프 버그 수정, Lambda 런타임 Python 3.13
 - [x] v1.2.0: 요약 형식 개편(한 줄 + 접힌 상세), Gemini 3.5 Flash-Lite, google-genai SDK로 이전
+- [x] v1.3.0: 다시 요약 버튼(이슈 #2), 미디어 표식·캡션 저장, `/summary` 별칭, `/about` 안내 수정

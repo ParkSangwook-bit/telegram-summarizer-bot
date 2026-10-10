@@ -4,7 +4,7 @@ from google.genai import types
 # 쓸 곳이 없어서 잠깐 적음
 GITHUB_URL = "https://github.com/ParkSangwook-bit/telegram-summarizer-bot"
 LAST_UPDATE = "2026-10-11"
-BOT_VERSION = "v1.2.0"
+BOT_VERSION = "v1.3.0"
 # =============================================
 
 
@@ -31,7 +31,7 @@ class AIConfig:
         )
     ]
 
-# 시스템 프롬프트 v6: C안(한 줄 + 접힌 상세). 2026-10-11 시안 A/B/C × 모델 3종 비교 실측으로 선정
+# 시스템 프롬프트 v6.1: C안(한 줄 + 접힌 상세) + 미디어 표식 안내. 2026-10-11 시안 A/B/C × 모델 3종 비교 실측으로 선정
 
 class PromptConfig:
     SYSTEM_TEMPLATE = """
@@ -45,6 +45,8 @@ class PromptConfig:
   <input>
     The chat log is wrapped in <logs>. <d>YYYY-MM-DD</d> starts a new date.
     <l u="name" t="HH:MM">message</l> is one message. Text is HTML-escaped.
+    A message may start with a media tag such as [사진], [동영상 0:35], [파일 name] or [스티커 😂].
+    The text after the tag is its caption. You cannot see the media itself, so never describe it.
   </input>
 
   <what_to_tell>
