@@ -108,25 +108,41 @@ def save_message_to_db(chat_id, message_id, user_name, text, message_date, media
         if media:
             item.update(media)
         table.put_item(Item=item)
+        return item
 
     except Exception as e:
         print(f"DB Save Error: {e}")
+        return None
 
 # ===============================================================
-# 유튜브 영상 요약 (링크가 올라오면 작업 함수가 미리 요약해 DB에 저장)
+# 작업 함수: 유튜브 영상 요약 · 사진/음성 설명 (올라오면 미리 처리해 DB에 저장)
 # ===============================================================
 
 YOUTUBE_PATTERN = re.compile(r"(?:youtube\.com/(?:watch\?\S*?v=|shorts/|live/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})")
 VIDEO_PARTITION = 'VIDEO_SUMMARY'  # 영상 요약 캐시 (대화와 섞이지 않게 별도 파티션)
+
+def invoke_worker(payload):
+    """ 작업 함수를 비동기로 호출 (웹훅 응답은 바로 끝남). 작업 함수가 없으면(로컬) 아무것도 안 함 """
+    worker = os.environ.get("MEDIA_WORKER_FUNCTION")
+    if worker:
+        lambda_client.invoke(FunctionName=worker, InvocationType='Event', Payload=json.dumps(payload))
+
+def request_media_description(item):
+    """ 저장한 메시지가 사진·짧은 음성이면 설명·받아쓰기를 작업 함수에 맡김 """
+    if not item or item.get('media_type') not in ('photo', 'voice'):
+        return
+    if item['media_type'] == 'voice' and int(item.get('duration', 0)) > settings.MediaConfig.VOICE_MAX_SECONDS:
+        return
+    invoke_worker({'chat_id': item['chat_id'], 'timestamp': item['timestamp'],
+                   'file_id': item['file_id'], 'media_type': item['media_type']})
 
 def youtube_ids(text):
     """ 글 속 유튜브 영상 ID (순서 유지, 중복 제거) """
     return list(dict.fromkeys(YOUTUBE_PATTERN.findall(text)))
 
 def request_video_summaries(text):
-    """ 글 속 유튜브 영상마다 요약을 한 번만 작업 함수에 맡김 (비동기라 웹훅 응답은 바로 끝남) """
-    worker = os.environ.get("VIDEO_WORKER_FUNCTION")
-    if not worker:
+    """ 글 속 유튜브 영상마다 요약을 한 번만 작업 함수에 맡김 """
+    if not os.environ.get("MEDIA_WORKER_FUNCTION"):
         return
     for video_id in youtube_ids(text):
         try:
@@ -140,7 +156,7 @@ def request_video_summaries(text):
             if e.response['Error']['Code'] != 'ConditionalCheckFailedException':
                 print(f"Video Request Error: {e}")
             continue
-        lambda_client.invoke(FunctionName=worker, InvocationType='Event', Payload=json.dumps({'video_id': video_id}))
+        invoke_worker({'video_id': video_id})
 
 def get_video_summaries(video_ids):
     """ {영상 ID: 요약} (요약이 끝난 것만) """
@@ -155,9 +171,49 @@ def get_video_summaries(video_ids):
         print(f"Video Summary Query Error: {e}")
         return {}
 
-def video_worker_handler(event, context):
-    """ 유튜브 영상 요약 작업 함수 (요약 봇이 비동기로 호출). 결과를 DB에 저장 """
-    video_id = event['video_id']
+def media_worker_handler(event, context):
+    """ 작업 함수 진입점 (요약 봇이 비동기로 호출): 유튜브 영상 요약 또는 사진·음성 설명 """
+    if 'video_id' in event:
+        return summarize_video(event['video_id'])
+    return describe_media_file(event)
+
+async def download_telegram_file(file_id):
+    async with telegram.Bot(token=os.environ.get("TELEGRAM_TOKEN")) as bot:
+        tg_file = await bot.get_file(file_id)
+        return bytes(await tg_file.download_as_bytearray())
+
+def describe_media_file(event):
+    """ 텔레그램에서 사진·음성을 받아 설명·받아쓰기를 만들고, 그 메시지 항목에 media_text로 저장 """
+    config = settings.MediaConfig
+    is_photo = event['media_type'] == 'photo'
+    try:
+        data = asyncio.run(download_telegram_file(event['file_id']))
+        response = client.models.generate_content(
+            model=settings.AIConfig.MODEL_NAME,
+            contents=[types.Part.from_bytes(data=data, mime_type='image/jpeg' if is_photo else 'audio/ogg'),
+                      config.DESCRIBE_PHOTO if is_photo else config.DESCRIBE_VOICE],
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(thinking_level=settings.AIConfig.THINKING_LEVEL),
+                safety_settings=settings.AIConfig.SAFETY_SETTINGS,
+                http_options=types.HttpOptions(timeout=config.TIMEOUT_MS),
+            ),
+        )
+        text = clip((response.text or "").strip(), config.TEXT_LENGTH)
+        if not text:
+            return {'status': 'failed'}
+        table.update_item(
+            Key={'chat_id': event['chat_id'], 'timestamp': event['timestamp']},
+            UpdateExpression='SET media_text = :t',
+            ExpressionAttributeValues={':t': text},
+            ConditionExpression='attribute_exists(chat_id)',  # 메시지가 이미 지워졌으면 새로 만들지 않음
+        )
+        return {'status': 'done'}
+    except Exception as e:
+        print(f"Media Describe Error: {event.get('media_type')}: {e}")
+        return {'status': 'failed'}
+
+def summarize_video(video_id):
+    """ 유튜브 영상을 요약해 VIDEO_SUMMARY 파티션에 저장 """
     item = {'chat_id': VIDEO_PARTITION, 'timestamp': video_id, 'message_id': 0}
     try:
         config = settings.VideoConfig
@@ -282,6 +338,36 @@ def strip_tags(text):
     """ HTML 전송이 실패했을 때 일반 텍스트로 보내기 위해 허용 태그를 걷어냄 """
     return re.sub(r"</?(b|i|code|blockquote)( expandable)?>", "", text)
 
+DETAIL_TIME = re.compile(r"^•\s*\[(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})\]\s*")
+
+def sort_details_by_time(text, last_timestamp):
+    """
+    args:
+        text (str): 모델 출력
+        last_timestamp (str): 대화의 마지막 메시지 시각 (연도 계산용)
+    features:
+        접힌 상세의 각 줄 앞 [MM/DD HH:MM](그 화제가 처음 나온 시각)으로 줄을 시간순 정렬하고 시각 표시는 지움
+        -> 모델이 중요도·최근순으로 섞어도 늘 "오래된 것 위, 최근 것 아래" (시각 없는 줄이 있으면 순서는 그대로)
+    """
+    block = re.search(r"(<blockquote expandable>)(.*?)(</blockquote>)", text, re.S)
+    if not block:
+        return text
+    last = datetime.fromisoformat(last_timestamp)
+    lines, keys = [], []
+    for line in (l.strip() for l in block.group(2).strip().splitlines() if l.strip()):
+        m = DETAIL_TIME.match(line)
+        if m:
+            month, day, hour, minute = map(int, m.groups())
+            year = last.year if (month, day) <= (last.month, last.day) else last.year - 1  # 연말연시 대비
+            keys.append((year, month, day, hour, minute))
+            line = "• " + line[m.end():]
+        else:
+            keys.append(None)
+        lines.append(line)
+    if None not in keys:
+        lines = [line for _, _, line in sorted(zip(keys, range(len(lines)), lines))]
+    return text[:block.start()] + block.group(1) + "\n".join(lines) + block.group(3) + text[block.end():]
+
 def to_seconds(duration):
     """ 텔레그램 duration(초 정수 또는 timedelta)을 초로 """
     return int(duration.total_seconds()) if hasattr(duration, "total_seconds") else int(duration or 0)
@@ -302,11 +388,16 @@ def media_file(message):
         return {'media_type': 'voice', 'file_id': message.voice.file_id, 'duration': to_seconds(message.voice.duration)}
     return None
 
+def attach_media_text(messages):
+    """ 작업 함수가 미리 만든 사진 설명·음성 받아쓰기를 표식 뒤에 붙인 사본 """
+    return [dict(m, message=f"{m['message']} — 내용: {m['media_text']}") if m.get('media_text') else m for m in messages]
+
 def pick_media(messages):
-    """ 최근 사진 몇 장과 짧은 음성 몇 개 (시간순) """
+    """ 아직 설명이 없는(방금 올라와 처리 중이거나 실패한) 최근 사진·짧은 음성 몇 개 (시간순) """
     config = settings.MediaConfig
-    photos = [m for m in messages if m.get('media_type') == 'photo'][-config.PHOTO_LIMIT:]
-    voices = [m for m in messages if m.get('media_type') == 'voice' and int(m.get('duration', 0)) <= config.VOICE_MAX_SECONDS][-config.VOICE_LIMIT:]
+    pending = [m for m in messages if not m.get('media_text')]
+    photos = [m for m in pending if m.get('media_type') == 'photo'][-config.PHOTO_LIMIT:]
+    voices = [m for m in pending if m.get('media_type') == 'voice' and int(m.get('duration', 0)) <= config.VOICE_MAX_SECONDS][-config.VOICE_LIMIT:]
     picked = {m['message_id'] for m in photos + voices}
     return [m for m in messages if m['message_id'] in picked]
 
@@ -561,7 +652,8 @@ async def send_summary(bot, chat_id, limit):
     links = recent_links(chat_history, settings.LinkConfig.LIMIT)
     titles, downloaded = await asyncio.gather(fetch_link_titles(links), download_media(bot, pick_media(chat_history)))
     titles = add_video_summaries(titles, links)  # 유튜브는 미리 만들어 둔 영상 요약도 덧붙임
-    messages, media_parts = attach_media(attach_link_titles(chat_history, titles), downloaded)
+    # 사진·음성은 미리 만든 설명을 붙이고, 아직 설명이 없는 것만 파일을 직접 첨부
+    messages, media_parts = attach_media(attach_link_titles(attach_media_text(chat_history), titles), downloaded)
     xml_data = format_messages_to_xml(messages)
 
     # AI 호출
@@ -580,6 +672,9 @@ async def send_summary(bot, chat_id, limit):
         if not response_text:
             await bot.send_message(chat_id=chat_id, text="❌ 요약을 만들지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
             return
+
+        # 접힌 상세를 화제가 처음 나온 시간순으로 (최근이 아래)
+        response_text = sort_details_by_time(response_text, chat_history[-1]['timestamp'])
 
         header = format_header(chat_history)
         reply_markup = more_buttons(limit)
@@ -730,7 +825,7 @@ async def main_logic(event, context):
                 
             # 일반 대화는 저장
             else:
-                save_message_to_db(
+                item = save_message_to_db(
                     chat_id=chat_id,
                     message_id=message.message_id,
                     # 익명 관리자·채널 글은 from_user가 없으므로 보낸 채팅 이름으로 대신함
@@ -739,7 +834,8 @@ async def main_logic(event, context):
                     message_date=message.date,
                     media=media_file(message)
                 )
-                # 유튜브 링크면 영상 요약을 미리 맡김 (작업 함수가 비동기로 처리)
+                # 사진·음성은 설명을, 유튜브 링크는 영상 요약을 미리 맡김 (작업 함수가 비동기로 처리)
+                request_media_description(item)
                 request_video_summaries(text)
 
         except Exception as e:

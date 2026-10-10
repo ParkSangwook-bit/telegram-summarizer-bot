@@ -49,7 +49,7 @@ Resources:
           TELEGRAM_TOKEN: !Ref TelegramTokenParameter
           GEMINI_API_KEY: !Ref GeminiApiKeyParameter
           DYNAMO_TABLE_NAME: !Ref ChatLogsTable
-          VIDEO_WORKER_FUNCTION: !Ref VideoWorkerFunction # 유튜브 영상 요약을 맡길 작업 함수
+          MEDIA_WORKER_FUNCTION: !Ref MediaWorkerFunction # 유튜브 영상 요약·사진/음성 설명을 맡길 작업 함수
 
       Events:
         ApiEvent:
@@ -64,26 +64,27 @@ Resources:
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref ChatLogsTable
-        # 영상 요약 작업 함수를 비동기로 호출할 권한
+        # 작업 함수를 비동기로 호출할 권한
         - LambdaInvokePolicy:
-            FunctionName: !Ref VideoWorkerFunction
+            FunctionName: !Ref MediaWorkerFunction
 
-  # 유튜브 영상 요약 작업 함수 (웹훅이 비동기로 호출 -> 결과를 DynamoDB에 저장)
-  # 영상 처리는 수 초~수십 초라 웹훅 안에서 기다리지 않음 (텔레그램 재전송·지연 방지)
-  VideoWorkerFunction:
+  # 작업 함수: 유튜브 영상 요약 · 사진 설명 · 음성 받아쓰기 (웹훅이 비동기로 호출 -> 결과를 DynamoDB에 저장)
+  # 처리에 수 초~수십 초가 걸려 웹훅 안에서 기다리지 않음 (텔레그램 재전송·지연 방지)
+  MediaWorkerFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
-      Handler: app.video_worker_handler
+      Handler: app.media_worker_handler
       Runtime: python3.13
       Timeout: 300 # 긴 영상 대비
       MemorySize: 512
       Architectures:
         - x86_64
       EventInvokeConfig:
-        MaximumRetryAttempts: 0 # 실패해도 같은 영상을 다시 처리하지 않음 (DB의 pending 표시는 1일 뒤 만료)
+        MaximumRetryAttempts: 0 # 실패해도 같은 작업을 다시 하지 않음 (영상의 pending 표시는 1일 뒤 만료)
       Environment:
         Variables:
+          TELEGRAM_TOKEN: !Ref TelegramTokenParameter # 사진·음성 파일을 텔레그램에서 받음
           GEMINI_API_KEY: !Ref GeminiApiKeyParameter
           DYNAMO_TABLE_NAME: !Ref ChatLogsTable
       Policies:
