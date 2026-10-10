@@ -7,7 +7,8 @@ import time
 from datetime import datetime, timedelta, timezone
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update # telegram ui용
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
@@ -23,15 +24,18 @@ dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table(settings.AWSConfig.DYNAMO_TABLE)
 
 if settings.AIConfig.API_KEY:
-    genai.configure(api_key=settings.AIConfig.API_KEY)
-    model = genai.GenerativeModel(
-        settings.AIConfig.MODEL_NAME,
-        generation_config=settings.AIConfig.GENERATION_CONFIG,
-        safety_settings=settings.AIConfig.SAFETY_SETTINGS,
+    client = genai.Client(
+        api_key=settings.AIConfig.API_KEY,
+        http_options=types.HttpOptions(timeout=settings.AIConfig.TIMEOUT_MS),
+    )
+    # temperature 등은 지정하지 않음: Gemini 3 계열은 기본값(1.0) 유지가 권장됨
+    generate_config = types.GenerateContentConfig(
         system_instruction=settings.PromptConfig.SYSTEM_TEMPLATE,
-        )
+        thinking_config=types.ThinkingConfig(thinking_level=settings.AIConfig.THINKING_LEVEL),
+        safety_settings=settings.AIConfig.SAFETY_SETTINGS,
+    )
 else:
-    model = None
+    client = None
 
 # ===============================================================
 # 헬퍼 함수 (DB & Logic)
@@ -140,7 +144,8 @@ def format_messages_to_xml(messages):
     args:
         messages (list): 메시지 딕셔너리 리스트
     features:
-        토큰 절약을 위한 XML 변환
+        메시지 경계와 화자를 분명히 하는 XML 변환
+        (참고: 토큰은 "이름: 말" 줄 형식보다 많음. 2026-10-11 실측, 메시지 100개 기준 2,399 vs 821)
     """
     xml = "<logs>\n"
     current_date = ""
@@ -163,6 +168,39 @@ def format_messages_to_xml(messages):
     xml += "</logs>"
 
     return xml
+
+def format_header(messages):
+    """
+    args:
+        messages (list): 시간순 메시지 딕셔너리 리스트
+    features:
+        요약 머리줄(메시지 수 + 시간 범위)을 코드에서 만듦 -> 모델이 날짜를 지어내지 않게 함
+    """
+    def short(timestamp):
+        date_part, time_part = timestamp.split('T')
+        _, month, day = date_part.split('-')
+        return f"{int(month)}/{int(day)}", time_part[:5]
+
+    first_day, first_time = short(messages[0]['timestamp'])
+    last_day, last_time = short(messages[-1]['timestamp'])
+    last = last_time if first_day == last_day else f"{last_day} {last_time}"
+    return f"📌 최근 {len(messages)}개 대화 · {first_day} {first_time} ~ {last}"
+
+def to_telegram_html(text):
+    """
+    args:
+        text (str): 모델 출력
+    features:
+        전부 이스케이프한 뒤, 프롬프트가 허용한 태그만 되살림 (<b>, <i>, <code>, <blockquote [expandable]>)
+    """
+    safe = html.escape(text)
+    for tag in ("b", "i", "code", "blockquote"):
+        safe = safe.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+    return safe.replace("&lt;blockquote expandable&gt;", "<blockquote expandable>")
+
+def strip_tags(text):
+    """ HTML 전송이 실패했을 때 일반 텍스트로 보내기 위해 허용 태그를 걷어냄 """
+    return re.sub(r"</?(b|i|code|blockquote)( expandable)?>", "", text)
 
 # ===============================================================
 # 핸들러 함수 (Command Handlers)
@@ -197,32 +235,34 @@ async def handle_summary(update, context):
     try:
         
         # AI에게 요약 생성 요청
-        input_chatlog = xml_data
-        
-        response = model.generate_content(input_chatlog)
+        response = client.models.generate_content(
+            model=settings.AIConfig.MODEL_NAME,
+            contents=xml_data,
+            config=generate_config,
+        )
 
-        response_text = response.text
+        response_text = (response.text or "").strip()
 
-        # 조금 마음에 안들지만 일단은 임시 안전장치
-        # 전부 이스케이프한 뒤, 프롬프트가 허용한 태그(<b>, <i>, <code>)만 되살림
-        final_text = html.escape(response_text)
-        for tag in ("b", "i", "code"):
-            final_text = final_text.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
-        # 임시 방어 로직
+        # 안전 필터 등으로 본문이 비어 오는 경우
+        if not response_text:
+            await context.bot.send_message(chat_id=chat_id, text="❌ 요약을 만들지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
+            return
+
+        header = format_header(chat_history)
 
         # 안전장치
         try:
             # HTML 모드로 전송
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=final_text,
+                text=f"{html.escape(header)}\n\n{to_telegram_html(response_text)}",
                 parse_mode='HTML'
             )
         except telegram.error.BadRequest:
             # HTML 파싱 에러 발생 시 -> 태그를 걷어낸 일반 텍스트로 재전송(전송 성공 보장)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=re.sub(r"</?(b|i|code)>", "", response_text),
+                text=f"{header}\n\n{strip_tags(response_text)}",
                 parse_mode=None
             )
         

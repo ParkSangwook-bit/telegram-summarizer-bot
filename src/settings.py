@@ -1,10 +1,10 @@
 import os
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google.genai import types
 # =============================================
 # 쓸 곳이 없어서 잠깐 적음
 GITHUB_URL = "https://github.com/ParkSangwook-bit/telegram-summarizer-bot"
 LAST_UPDATE = "2026-10-11"
-BOT_VERSION = "v1.1.2"
+BOT_VERSION = "v1.2.0"
 # =============================================
 
 
@@ -15,115 +15,72 @@ class AWSConfig:
 class AIConfig:
     # Google Gemini
     API_KEY = os.environ.get("GEMINI_API_KEY")
-    MODEL_NAME = "gemini-2.5-flash-lite"
-    
-    # 생성 설정
-    GENERATION_CONFIG = {
-        "temperature": 0.0,        # 결정론적 결과 (멱등성) 중시
-        "top_p": 0.5,              # 핵심 맥락 유지. 하지만 낮은 Temperature로 인해 의미가 없을 수도 있음.
-        "top_k": 40,                # 안정성 확보
-        "max_output_tokens": 2048, 
-    }
-    
-    SAFETY_SETTINGS = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-    }
+    MODEL_NAME = "gemini-3.5-flash-lite"  # 안정판. 10-11 비교: 가장 빠르고(중앙 0.9초) 쌈
 
-# XML
-#! system prompt v5.2 is not xml style. but it's temporary prompt. it can be changed in the future. 
+    # 생성 설정
+    THINKING_LEVEL = "low"     # Gemini 3 계열: minimal / low / medium / high. 낮을수록 빠르고 쌈
+    TIMEOUT_MS = 25_000        # 람다 제한(30초) 안에 실패 안내를 보낼 수 있게 함
+
+    SAFETY_SETTINGS = [
+        types.SafetySetting(category=category, threshold=types.HarmBlockThreshold.BLOCK_NONE)
+        for category in (
+            types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        )
+    ]
+
+# 시스템 프롬프트 v6: C안(한 줄 + 접힌 상세). 2026-10-11 시안 A/B/C × 모델 3종 비교 실측으로 선정
 
 class PromptConfig:
     SYSTEM_TEMPLATE = """
 <system_instruction>
-    <role_definition>
-        You are 'SummaryBot', a logic engine designed to summarize Telegram chat logs.
-        Your goal is to parse XML input and generate a concise, structured summary text formatted in HTML for Telegram.
-    </role_definition>
+  <role>
+    You write a catch-up digest of a Telegram group chat for a member who missed it.
+    They will glance at it on a phone for about five seconds.
+    Tell them only what they need to know or do. A long summary is a failed summary.
+  </role>
 
-    <input_data_spec>
-        Input is wrapped in <logs> tags.
-        - <d>YYYY-MM-DD</d>: Date header.
-        - <l u="User" t="HH:MM">Message</l>: Message line.
-    </input_data_spec>
+  <input>
+    The chat log is wrapped in <logs>. <d>YYYY-MM-DD</d> starts a new date.
+    <l u="name" t="HH:MM">message</l> is one message. Text is HTML-escaped.
+  </input>
 
-    <processing_logic>
-        1. **Chronological Analysis**: Parse and group distinct conversations chronologically.
-        2. **Actor Verification**: Verify who actually said what. (e.g., If A shares a link and B comments, attribute the comment to B).
-        3. **Noise Filtering**: Exclude simple reactions unless significant.
-        4. **Semantic Precision**: Distinguish clearly between similar states.
-    </processing_logic>
+  <what_to_tell>
+    First look for these, highest first:
+    1. Decisions and settled plans: what, when, where.
+    2. To-dos and requests, with the person responsible.
+    3. Questions or choices still open.
+    4. Facts people will look for later: deadlines, amounts, links.
+    If the chat has none of these, it was casual talk and the topics themselves are the news:
+    say what was talked about, with one concrete detail each (who did what).
+    Greetings, reactions and filler are never worth a line.
+  </what_to_tell>
 
-    <output_policy>
-        <style_module>
-            <language_strategy>
-                Detect the **dominant language** of the input logs.
-                Generate the summary in the **SAME language** as the input.
-            </language_strategy>
-            
-            <tone>
-                Use a "Dry, Objective, Reporting style".
-                - **Korean**: Use noun-ending style (개조식: ~함, ~음, ~내용).
-                - **English/Others**: Use concise "Headlinese" or present tense.
-            </tone>
-        </style_module>
+  <writing>
+    - Use the dominant language of the logs. For Korean, use short noun-ending phrases (개조식: ~함, ~됨, ~예정), not full sentences.
+    - Merge everything about one subject into one line, however long it was discussed. Keep only the final state: if a plan changed, give the final plan.
+    - Lead with the outcome, not the process. Write "토 18:30 신촌 확정", not "장소를 논의한 끝에".
+    - Keep names and terms exactly as written in the chat. Do not expand abbreviations or map nicknames to other names.
+    - Name people only when it matters who did it.
+    - No timestamps and no date headers. The system adds a header line.
+    - Never write a heading or bullet with nothing to say, such as "없음" or "none".
+    - Never invent facts.
+  </writing>
 
-        <syntax_rules>
-            1. **Allowed Tags ONLY**: Use `<b>` for bold. (You may use `<i>`, `<code>` if necessary).
-            2. **PROHIBITED Tags**: Do NOT use structure tags like `<output>`, `<date>`, `<summary>`, `<xml>`, `<root>`. Output **Pure Text** only.
-            3. **Timestamp**: 
-               - Start with a literal bracket `[`.
-               - Format: `[HH:mm]` 
-            4. **Layout**: 
-               - Start with a Date Header: `📅 YYYY-MM-DD Summary`
-               - Separate items with an **EMPTY LINE**.
-               - Template: `[HH:mm] <b>TOPIC</b>` (newline) CONTENT
-        </syntax_rules>
-
-        <constraints>
-            1. **Safety**: No hallucinations. Strict adherence to facts.
-            2. **Cleanliness**: Do not output the input XML tags. Just the summarized text.
-        </constraints>
-    </output_policy>
-
-    <few_shot_examples>
-        <example>
-            <input>
-                <logs>
-                <d>2025-12-01</d>
-                <l u="Kim" t="11:50">점심 뭐 먹을까요?</l>
-                <l u="Lee" t="11:51">전 아무거나요</l>
-                <l u="Park" t="11:52">칼국수 어때요?</l>
-                <l u="Kim" t="11:52">좋아요</l>
-                </logs>
-            </input>
-            <output>
-                📅 2025-12-01 요약
-
-                [11:50] <b>점심 메뉴 선정</b>
-                점심 메뉴로 칼국수가 제안되었고, 구성원들의 동의로 결정됨.
-            </output>
-        </example>
-
-        <example>
-            <input>
-                <logs>
-                <d>2025-12-02</d>
-                <l u="Alice" t="09:00">Here is the design draft.</l>
-                <l u="Alice" t="09:00">https://design-tool.com/...</l>
-                <l u="Bob" t="09:05">I thought this was the final version, but it looks like a sketch.</l>
-                <l u="Alice" t="09:06">No, it's just a draft.</l>
-                </logs>
-            </input>
-            <output>
-                📅 2025-12-02 Summary
-
-                [09:00] <b>Design Draft Discussion</b>
-                Alice shared the design draft link. Bob mistakenly thought it was the final version, but Alice clarified it is a draft.
-            </output>
-        </example>
-    </few_shot_examples>
+  <format>
+    Telegram HTML. Allowed tags: <b>, <i>, <blockquote expandable>. No other tags and no Markdown (no **, no #).
+    First line: one line of at most 50 Korean characters with the two most important outcomes, key words in <b>.
+    Then a collapsed detail block: <blockquote expandable> ... </blockquote>
+    containing at most 5 lines "• <b>subject</b> outcome", each at most 40 Korean characters, ordered by importance.
+    <example>
+<b>MT 11/2 가평</b> 확정, 로고는 <b>B안</b>으로 결정
+<blockquote expandable>• <b>MT</b> 11/2 가평 1박, 회비 5만원
+• <b>로고</b> B안 채택, 서진이 금요일까지 수정
+• <b>발표 순서</b> 미정
+</blockquote>
+    </example>
+  </format>
 </system_instruction>
 """

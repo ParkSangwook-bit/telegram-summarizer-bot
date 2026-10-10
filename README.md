@@ -1,6 +1,6 @@
 # Telegram Chat Summarizer Bot (v1.0)
 
-![Python](https://img.shields.io/badge/Python-3.10-blue?logo=python&logoColor=white)  ![AWS](https://img.shields.io/badge/AWS-Lambda%20%7C%20DynamoDB-orange?logo=amazon-aws&logoColor=white)  ![Gemini](https://img.shields.io/badge/AI-Google%20Gemini-8E75B2?logo=googlegemini&logoColor=white)  ![License](https://img.shields.io/badge/License-MIT-green)
+![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python&logoColor=white)  ![AWS](https://img.shields.io/badge/AWS-Lambda%20%7C%20DynamoDB-orange?logo=amazon-aws&logoColor=white)  ![Gemini](https://img.shields.io/badge/AI-Google%20Gemini-8E75B2?logo=googlegemini&logoColor=white)  ![License](https://img.shields.io/badge/License-MIT-green)
 
 > **"대화 30개가 300개처럼 느껴지는 바쁜 당신을 위해."**
 >> 텔레그램 그룹 채팅방의 대화를 놓쳐도 걱정하지 마세요. AI가 핵심만 요약해 드립니다.
@@ -51,11 +51,11 @@ graph LR
 
 ## 🛠 기술 스택 (Tech Stack)
 
-- **Language**: Python 3.10
+- **Language**: Python 3.13
 - **Framework**: AWS SAM (Serverless Application Model)
 - **Infrastructure**: AWS Lambda, API Gateway, DynamoDB
-- **AI Model**: Google Gemini-2.5-Flash-Lite (Cost-Effective)
-- **Library**: `python-telegram-bot` (Async), `boto3`, `google-generativeai`
+- **AI Model**: Google Gemini 3.5 Flash-Lite (안정판, 빠르고 저렴)
+- **Library**: `python-telegram-bot` (Async), `boto3`, `google-genai`
 
 
 ## 💡 핵심 기술 및 설계 (Key Engineering Patterns)
@@ -107,7 +107,7 @@ sequenceDiagram
 ### 1. 사전 준비 (Prerequisites)
 
 - AWS 계정 및 CLI 설정 (`aws configure`)
-- SAM CLI, Python 3.10+, Poetry 설치
+- SAM CLI, Python 3.13, Poetry 설치
 - Telegram Bot Token 및 Google Gemini API Key 발급
 
 ### 2. 설치
@@ -143,3 +143,5 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_UR
 - [x] v1.0: 기본 요약 기능 및 DB 연동 완료
 - [x] v1.1.0: 마이너 리팩토링(저장과 요약에서의 중복 방지 로직 추가, ai 프롬프트 방식 개선)
 - [x] v1.1.1: 시스템 프롬프트 개선 및 마이너 업데이트(명령어 수정, 에러 메시지 개선)
+- [x] v1.1.2: 요약 전송 시 HTML 이스케이프 버그 수정, Lambda 런타임 Python 3.13
+- [x] v1.2.0: 요약 형식 개편(한 줄 + 접힌 상세), Gemini 3.5 Flash-Lite, google-genai SDK로 이전
