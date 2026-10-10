@@ -1,4 +1,5 @@
 import os
+import re
 import html
 import json
 import asyncio
@@ -203,24 +204,26 @@ async def handle_summary(update, context):
         response_text = response.text
 
         # 조금 마음에 안들지만 일단은 임시 안전장치
-        safe_text = html.escape(response_text)
-        final_text = safe_text.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+        # 전부 이스케이프한 뒤, 프롬프트가 허용한 태그(<b>, <i>, <code>)만 되살림
+        final_text = html.escape(response_text)
+        for tag in ("b", "i", "code"):
+            final_text = final_text.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
         # 임시 방어 로직
 
         # 안전장치
         try:
-            # 마크다운 모드로 전송
+            # HTML 모드로 전송
             await context.bot.send_message(
-                chat_id=chat_id, 
-                text=response_text, 
+                chat_id=chat_id,
+                text=final_text,
                 parse_mode='HTML'
             )
         except telegram.error.BadRequest:
-            # 마크다운 파싱 에러 발생 시 -> 일반 텍스트로 재전송(전송 성공 보장)
+            # HTML 파싱 에러 발생 시 -> 태그를 걷어낸 일반 텍스트로 재전송(전송 성공 보장)
             await context.bot.send_message(
-                chat_id=chat_id, 
-                text=response_text, 
-                parse_mode=None 
+                chat_id=chat_id,
+                text=re.sub(r"</?(b|i|code)>", "", response_text),
+                parse_mode=None
             )
         
     except Exception as e:
