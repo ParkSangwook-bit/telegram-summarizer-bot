@@ -1,4 +1,5 @@
 import os
+import html
 import json
 import asyncio
 import time
@@ -22,7 +23,12 @@ table = dynamodb.Table(settings.AWSConfig.DYNAMO_TABLE)
 
 if settings.AIConfig.API_KEY:
     genai.configure(api_key=settings.AIConfig.API_KEY)
-    model = genai.GenerativeModel(settings.AIConfig.MODEL_NAME)
+    model = genai.GenerativeModel(
+        settings.AIConfig.MODEL_NAME,
+        generation_config=settings.AIConfig.GENERATION_CONFIG,
+        safety_settings=settings.AIConfig.SAFETY_SETTINGS,
+        system_instruction=settings.PromptConfig.SYSTEM_TEMPLATE,
+        )
 else:
     model = None
 
@@ -147,9 +153,10 @@ def format_messages_to_xml(messages):
         if date_part != current_date:
             xml += f'<d>{date_part}</d>\n'
             current_date = date_part
-            
-        user = msg['user_name']
-        text = msg['message']
+        
+        # 이름이나 내용에 <>태그가 있으면 무력화 -> 시스템 프롬프트의 xml 태그 방어 로직
+        user = html.escape(msg['user_name'])
+        text = html.escape(msg['message'])
         xml += f'<l u="{user}" t="{time_str}">{text}</l>\n'
         
     xml += "</logs>"
@@ -187,16 +194,18 @@ async def handle_summary(update, context):
     
     # AI 호출
     try:
-        final_input_prompt = f"{settings.PromptConfig.SYSTEM_TEMPLATE}\n{xml_data}"
         
         # AI에게 요약 생성 요청
-        response = model.generate_content(
-            final_input_prompt,
-            generation_config=settings.AIConfig.GENERATION_CONFIG,
-            safety_settings=settings.AIConfig.SAFETY_SETTINGS
-        )
+        input_chatlog = xml_data
         
+        response = model.generate_content(input_chatlog)
+
         response_text = response.text
+
+        # 조금 마음에 안들지만 일단은 임시 안전장치
+        safe_text = html.escape(response_text)
+        final_text = safe_text.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+        # 임시 방어 로직
 
         # 안전장치
         try:
@@ -204,7 +213,7 @@ async def handle_summary(update, context):
             await context.bot.send_message(
                 chat_id=chat_id, 
                 text=response_text, 
-                parse_mode='Markdown'
+                parse_mode='HTML'
             )
         except telegram.error.BadRequest:
             # 마크다운 파싱 에러 발생 시 -> 일반 텍스트로 재전송(전송 성공 보장)
