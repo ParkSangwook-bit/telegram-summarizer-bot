@@ -4,7 +4,11 @@ import html
 import json
 import asyncio
 import time
+import socket
+import ipaddress
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, urljoin, quote
+import httpx
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update # telegram ui용
 from google import genai
@@ -249,6 +253,120 @@ def describe_media(message):
     return f"{tag} {message.caption}" if message.caption else tag
 
 # ===============================================================
+# 링크 제목 가져오기 (요약할 때만, 최근 링크 몇 개)
+# ===============================================================
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+LINK_HEADERS = {"User-Agent": f"TelegramSummaryBot/{settings.BOT_VERSION} (+{settings.GITHUB_URL})"}
+TITLE_PATTERNS = [re.compile(p, re.I | re.S) for p in (
+    r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title',
+    r"<title[^>]*>(.*?)</title>",
+)]
+DESC_PATTERNS = [re.compile(p, re.I | re.S) for p in (
+    r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description',
+    r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)',
+)]
+
+def clean_url(url):
+    """ 문장 부호가 붙어 잡힌 끝부분을 떼어냄 ("(https://a.b/c)." -> "https://a.b/c") """
+    url = url.rstrip(".,;:!?…'\"")
+    while url.endswith(")") and url.count("(") < url.count(")"):
+        url = url[:-1]
+    return url
+
+def recent_links(messages, limit):
+    """ 최근 메시지부터 중복 없이 링크 limit개 """
+    links = []
+    for msg in reversed(messages):
+        for url in map(clean_url, URL_PATTERN.findall(msg['message'])):
+            if url not in links:
+                links.append(url)
+    return links[:limit]
+
+def is_public_url(url):
+    """
+    features:
+        http(s)·기본 포트·공개 IP로만 풀리는 주소만 허용 (SSRF 방어)
+        -> 람다 내부 런타임 API(127.0.0.1:9001) 같은 곳에 접속하지 않게 함
+    """
+    try:
+        parts = urlparse(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname or parts.port not in (None, 80, 443):
+            return False
+        addresses = {info[4][0].split('%')[0] for info in socket.getaddrinfo(parts.hostname, None)}
+        return bool(addresses) and all(ipaddress.ip_address(address).is_global for address in addresses)
+    except (ValueError, OSError):
+        return False
+
+def clip(text, length):
+    text = " ".join(html.unescape(text).split())
+    return text if len(text) <= length else text[:length - 1] + "…"
+
+async def fetch_link_title(http, url):
+    """ 링크 하나의 "제목 — 설명". 실패하면 None """
+    host = urlparse(url).hostname or ""
+    if host in ("youtu.be", "youtube.com") or host.endswith(".youtube.com"):
+        # 유튜브는 oEmbed로 제목·채널을 받음
+        r = await http.get(f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json")
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        return clip(f"{data.get('title', '')} — {data.get('author_name', '')}", settings.LinkConfig.TITLE_LENGTH)
+
+    for _ in range(3):  # 리다이렉트는 단계마다 주소를 다시 검사
+        if not await asyncio.to_thread(is_public_url, url):
+            return None
+        async with http.stream("GET", url) as r:
+            if r.is_redirect and "location" in r.headers:
+                url = urljoin(url, r.headers["location"])
+                continue
+            if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
+                return None
+            body = b""
+            async for chunk in r.aiter_bytes():
+                body += chunk
+                if len(body) >= settings.LinkConfig.MAX_BYTES:  # 앞부분(head)만 읽음
+                    break
+            page = body.decode(r.encoding or "utf-8", errors="replace")
+        title = next((m.group(1) for p in TITLE_PATTERNS if (m := p.search(page))), None)
+        if not title:
+            return None
+        desc = next((m.group(1) for p in DESC_PATTERNS if (m := p.search(page))), None)
+        return clip(f"{title} — {desc}" if desc else title, settings.LinkConfig.TITLE_LENGTH)
+    return None
+
+async def fetch_link_titles(urls):
+    """ 링크들의 제목을 병렬로 가져옴. {url: "제목 — 설명"} (실패·시간 초과한 링크는 빠짐) """
+    if not urls:
+        return {}
+
+    async def one(http, url):
+        try:
+            return url, await fetch_link_title(http, url)
+        except Exception:
+            return url, None
+
+    async with httpx.AsyncClient(timeout=settings.LinkConfig.TIMEOUT, headers=LINK_HEADERS, follow_redirects=False) as http:
+        tasks = [asyncio.create_task(one(http, url)) for url in urls]
+        done, pending = await asyncio.wait(tasks, timeout=settings.LinkConfig.TOTAL_TIMEOUT)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+    return {url: title for url, title in (task.result() for task in done) if title}
+
+def attach_link_titles(messages, titles):
+    """ 메시지 속 링크 뒤에 [링크: 제목 — 설명]을 붙인 사본 (DB 원본은 그대로) """
+    if not titles:
+        return messages
+    attached = []
+    for msg in messages:
+        found = [titles[url] for url in map(clean_url, URL_PATTERN.findall(msg['message'])) if url in titles]
+        attached.append(dict(msg, message=msg['message'] + "".join(f" [링크: {t}]" for t in found)) if found else msg)
+    return attached
+
+# ===============================================================
 # 핸들러 함수 (Command Handlers)
 # ===============================================================
 
@@ -292,7 +410,9 @@ async def send_summary(bot, chat_id, limit):
         await bot.send_message(chat_id=chat_id, text="요약할 대화 내용이 없습니다.")
         return
 
-    xml_data = format_messages_to_xml(chat_history)
+    # 최근 링크의 제목·설명을 맥락에 붙임 (실패해도 요약은 진행)
+    titles = await fetch_link_titles(recent_links(chat_history, settings.LinkConfig.LIMIT))
+    xml_data = format_messages_to_xml(attach_link_titles(chat_history, titles))
     
     # AI 호출
     try:
@@ -349,6 +469,7 @@ async def handle_about(update, context):
         "- <code>/sum</code>: 최근 100개 대화 요약 (<code>/sum 200</code>처럼 개수 지정, 최대 500)\n"
         "- 요약 아래 버튼으로 더 많은 대화를 다시 요약\n"
         "- 사진·동영상·파일은 표식과 캡션으로 요약에 포함\n"
+        "- 링크는 페이지 제목·설명을 읽어 요약에 포함\n"
         "- 대화 자동 저장 및 7일 뒤 삭제 (TTL)\n\n"
         f"📅 <b>마지막 업데이트:</b> {settings.LAST_UPDATE}"
     )

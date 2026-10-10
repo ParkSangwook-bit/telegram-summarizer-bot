@@ -20,6 +20,7 @@ _[작동 영상 추가 예정]_
 - AI 요약: `/sum`(기본 100개, `/sum 200`처럼 개수 지정, 최대 500)으로 최근 대화를 Gemini가 한 줄 + 접힌 상세로 요약합니다.
 - 다시 요약 버튼: 요약 아래 [최근 200개로 다시] [최근 500개로 다시] 버튼으로 숫자를 치지 않고 범위를 넓힙니다.
 - 미디어 표식: 사진·동영상·음성·스티커·파일·투표는 `[사진] 캡션` 같은 표식으로 저장되어 요약 맥락에 들어갑니다.
+- 링크 읽기: 요약할 때 최근 링크 10개의 페이지 제목·설명(유튜브는 제목·채널)을 가져와 맥락에 넣습니다. 공개 주소의 80·443 포트만 열고, 내부 주소는 막습니다.
 - UI/UX: 대기 메시지 및 에러 발생 시 사용자 알림 기능을 제공함.
 - AWS Lambda의 서버리스 프리티어와 gemini api를 통해서 유지비용 최소화
 
@@ -57,7 +58,7 @@ graph LR
 - **Framework**: AWS SAM (Serverless Application Model)
 - **Infrastructure**: AWS Lambda, API Gateway, DynamoDB
 - **AI Model**: Google Gemini 3.5 Flash-Lite (안정판, 빠르고 저렴)
-- **Library**: `python-telegram-bot` (Async), `boto3`, `google-genai`
+- **Library**: `python-telegram-bot` (Async), `boto3`, `google-genai`, `httpx`
 
 
 ## 💡 핵심 기술 및 설계 (Key Engineering Patterns)
@@ -148,3 +149,4 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_UR
 - [x] v1.1.2: 요약 전송 시 HTML 이스케이프 버그 수정, Lambda 런타임 Python 3.13
 - [x] v1.2.0: 요약 형식 개편(한 줄 + 접힌 상세), Gemini 3.5 Flash-Lite, google-genai SDK로 이전
 - [x] v1.3.0: 다시 요약 버튼(이슈 #2), 미디어 표식·캡션 저장, `/summary` 별칭, `/about` 안내 수정
+- [x] v1.4.0: 링크 제목·설명을 요약 맥락에 포함 (SSRF 방어 포함)
