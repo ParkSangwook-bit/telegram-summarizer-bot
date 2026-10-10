@@ -48,8 +48,9 @@ Resources:
           # 직접 cli에서 입력하는 것으로 유출 방지
           TELEGRAM_TOKEN: !Ref TelegramTokenParameter
           GEMINI_API_KEY: !Ref GeminiApiKeyParameter
-          DYNAMO_TABLE_NAME: !Ref ChatLogsTable 
-      
+          DYNAMO_TABLE_NAME: !Ref ChatLogsTable
+          VIDEO_WORKER_FUNCTION: !Ref VideoWorkerFunction # 유튜브 영상 요약을 맡길 작업 함수
+
       Events:
         ApiEvent:
           Type: Api
@@ -62,7 +63,32 @@ Resources:
       # 함수 DynamoDB 테이블 접근 권한 부여.
       Policies:
         - DynamoDBCrudPolicy:
-            TableName: !Ref ChatLogsTable 
+            TableName: !Ref ChatLogsTable
+        # 영상 요약 작업 함수를 비동기로 호출할 권한
+        - LambdaInvokePolicy:
+            FunctionName: !Ref VideoWorkerFunction
+
+  # 유튜브 영상 요약 작업 함수 (웹훅이 비동기로 호출 -> 결과를 DynamoDB에 저장)
+  # 영상 처리는 수 초~수십 초라 웹훅 안에서 기다리지 않음 (텔레그램 재전송·지연 방지)
+  VideoWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.video_worker_handler
+      Runtime: python3.13
+      Timeout: 300 # 긴 영상 대비
+      MemorySize: 512
+      Architectures:
+        - x86_64
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0 # 실패해도 같은 영상을 다시 처리하지 않음 (DB의 pending 표시는 1일 뒤 만료)
+      Environment:
+        Variables:
+          GEMINI_API_KEY: !Ref GeminiApiKeyParameter
+          DYNAMO_TABLE_NAME: !Ref ChatLogsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ChatLogsTable
 
   # DynamoDB 테이블
   ChatLogsTable:
