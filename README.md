@@ -154,3 +154,4 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_UR
 - [x] v1.4.0: 링크 제목·설명을 요약 맥락에 포함 (SSRF 방어 포함)
 - [x] v1.5.0: 사진·음성 내용 읽기, 유튜브 영상 미리 요약(비동기 작업 함수 + DynamoDB 캐시)
 - [x] v1.6.0: 요약 상세를 시간순(최근이 아래)으로, 사진·음성도 올라올 때 미리 처리해 저장
+- [x] v1.6.1: 프롬프트의 시각 지시 충돌 정리(상세 줄 앞 시각 태그만 예외)
