@@ -136,10 +136,13 @@ _(배포 과정에서 API Key 등을 입력받습니다.)_
 ### 4. 웹훅 연결 (Webhook Setup)
 배포가 완료되면 Outputs에 출력된 URL을 사용하여 텔레그램과 봇을 연결해야 합니다.
 
+봇은 텔레그램이 보낸 요청만 받습니다. 웹훅의 비밀 토큰(`secret_token`)은 봇 토큰에서 계산한 값이어야 하며, 다른 요청은 403으로 거절합니다.
+
 ```shell
 # [TOKEN]과 [API_GATEWAY_URL]을 본인의 것으로 변경하여 터미널에서 실행.
 # 주의: []는 제외하고 입력.
-curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_URL]&drop_pending_updates=true"
+SECRET=$(python -c "import hmac,hashlib;print(hmac.new(b'[TOKEN]',b'telegram-webhook-secret',hashlib.sha256).hexdigest())")
+curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook" -d "url=[API_GATEWAY_URL]" -d "secret_token=$SECRET" -d "drop_pending_updates=true"
 ```
 
 ***
@@ -155,3 +158,5 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook?url=[API_GATEWAY_UR
 - [x] v1.5.0: 사진·음성 내용 읽기, 유튜브 영상 미리 요약(비동기 작업 함수 + DynamoDB 캐시)
 - [x] v1.6.0: 요약 상세를 시간순(최근이 아래)으로, 사진·음성도 올라올 때 미리 처리해 저장
 - [x] v1.6.1: 프롬프트의 시각 지시 충돌 정리(상세 줄 앞 시각 태그만 예외)
+- [x] v1.6.2: 사진 설명에서 노출 정도를 완곡하게 바꾸지 않음, 모델 판정 로그
+- [x] v1.7.0: 웹훅 비밀 토큰 검사(위조 업데이트 거절)

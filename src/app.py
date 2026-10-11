@@ -4,6 +4,8 @@ import html
 import json
 import asyncio
 import time
+import hmac
+import hashlib
 import socket
 import ipaddress
 from datetime import datetime, timedelta, timezone
@@ -861,5 +863,18 @@ async def main_logic(event, context):
 
     return {"statusCode": 200, "body": "OK"}
 
+def webhook_secret():
+    """ 웹훅 비밀 토큰 = 봇 토큰에서 유도 (따로 보관할 비밀이 늘지 않음, setWebhook의 secret_token과 같은 값) """
+    return hmac.new(os.environ.get("TELEGRAM_TOKEN", "").encode(), b"telegram-webhook-secret", hashlib.sha256).hexdigest()
+
+def is_from_telegram(event):
+    """ 텔레그램이 보낸 요청인지: X-Telegram-Bot-Api-Secret-Token 머리값 확인 """
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    return hmac.compare_digest(headers.get("x-telegram-bot-api-secret-token") or "", webhook_secret())
+
 def lambda_handler(event, context):
+    # 텔레그램이 아닌 곳에서 온 요청(위조 업데이트)은 처리하지 않음
+    if not is_from_telegram(event):
+        print("Rejected: missing or wrong webhook secret")
+        return {"statusCode": 403, "body": "Forbidden"}
     return asyncio.run(main_logic(event, context))

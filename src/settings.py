@@ -4,7 +4,7 @@ from google.genai import types
 # 쓸 곳이 없어서 잠깐 적음
 GITHUB_URL = "https://github.com/ParkSangwook-bit/telegram-summarizer-bot"
 LAST_UPDATE = "2026-10-11"
-BOT_VERSION = "v1.6.2"
+BOT_VERSION = "v1.7.0"
 # =============================================
 
 
