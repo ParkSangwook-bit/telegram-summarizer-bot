@@ -76,7 +76,7 @@ def is_duplicate_request(update_id):
         print(f"Deduplication Error: {e}")
         return False
 
-def save_message_to_db(chat_id, message_id, user_name, text, message_date, media=None):
+def save_message_to_db(chat_id, message_id, user_name, text, message_date, media=None, user_id=None):
     """
     args:
         chat_id (int): 텔레그램 채팅 ID
@@ -85,6 +85,7 @@ def save_message_to_db(chat_id, message_id, user_name, text, message_date, media
         text (str): 메시지 내용
         message_date (int): 메시지 날짜
         media (dict): 사진·음성의 파일 정보 (요약 때 Gemini에 함께 보냄)
+        user_id (int): 보낸 사람 번호 (멤버 제외·사람별 기능용. 이름은 겹치거나 바뀔 수 있음)
     features:
         메시지를 DynamoDB에 저장
     """
@@ -109,6 +110,8 @@ def save_message_to_db(chat_id, message_id, user_name, text, message_date, media
         }
         if media:
             item.update(media)
+        if user_id is not None:
+            item['user_id'] = int(user_id)
         table.put_item(Item=item)
         return item
 
@@ -188,7 +191,9 @@ def log_model_verdict(where, response):
         print(f"Model Verdict [{where}] unreadable: {e}")
 
 def media_worker_handler(event, context):
-    """ 작업 함수 진입점 (요약 봇이 비동기로 호출): 유튜브 영상 요약 또는 사진·음성 설명 """
+    """ 작업 함수 진입점 (요약 봇이 비동기로 호출): 답장 상세 읽기 / 유튜브 영상 요약 / 사진·음성 설명 """
+    if event.get('task') == 'detail':
+        return handle_detail(event)
     if 'video_id' in event:
         return summarize_video(event['video_id'])
     return describe_media_file(event)
@@ -258,18 +263,108 @@ def summarize_video(video_id):
     table.put_item(Item=item)
     return {'video_id': video_id, 'status': item['status']}
 
-def get_clean_chat_history(chat_id, limit=100):
+# ---------------------------------------------------------------
+# 답장으로 부른 상세 읽기 (작업 함수)
+# ---------------------------------------------------------------
+
+STRIP_BLOCKS = re.compile(r"<(script|style|noscript|svg|template)\b.*?</\1>", re.I | re.S)
+
+def fetch_page_text(url):
+    """ 웹페이지 본문 글자 (링크 제목과 같은 SSRF 방어·리다이렉트 재검사). 실패하면 "" """
+    with httpx.Client(timeout=10.0, headers=LINK_HEADERS, follow_redirects=False) as http:
+        for _ in range(3):
+            if not is_public_url(url):
+                return ""
+            with http.stream("GET", url) as r:
+                if r.is_redirect and "location" in r.headers:
+                    url = urljoin(url, r.headers["location"])
+                    continue
+                if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
+                    return ""
+                body = b""
+                for chunk in r.iter_bytes():
+                    body += chunk
+                    if len(body) >= 2_000_000:
+                        break
+                page = body.decode(r.encoding or "utf-8", errors="replace")
+            text = html.unescape(re.sub(r"<[^>]+>", " ", STRIP_BLOCKS.sub(" ", page)))
+            return " ".join(text.split())[:settings.DetailConfig.PAGE_MAX_CHARS]
+    return ""
+
+def describe_in_detail(event):
+    """ 상세 읽기 본문(모델 출력): 유튜브 영상 / 웹페이지 / 사진 / 음성 """
+    config = settings.DetailConfig
+    kind = event['kind']
+    extra = {}
+    if kind == 'youtube':
+        video = settings.VideoConfig
+        contents = [types.Part(file_data=types.FileData(file_uri=f"https://www.youtube.com/watch?v={youtube_ids(event['url'])[0]}", mime_type="video/*"),
+                               video_metadata=types.VideoMetadata(fps=video.FPS, end_offset=f"{video.MAX_SECONDS}s")),
+                    config.YOUTUBE]
+        extra['media_resolution'] = types.MediaResolution.MEDIA_RESOLUTION_LOW
+    elif kind == 'page':
+        text = fetch_page_text(event['url'])
+        if len(text) >= config.PAGE_MIN_CHARS:
+            contents = [f"{config.PAGE}\n\n<page url=\"{html.escape(event['url'])}\">\n{html.escape(text)}\n</page>"]
+        else:
+            # 로그인 벽·스크립트로만 그리는 페이지 등은 Gemini URL 읽기 도구로 한 번 더
+            contents = [f"{config.PAGE_BY_URL}\n{event['url']}"]
+            extra['tools'] = [types.Tool(url_context=types.UrlContext())]
+    else:
+        is_photo = kind == 'photo'
+        data = asyncio.run(download_telegram_file(event['file_id']))
+        contents = [types.Part.from_bytes(data=data, mime_type='image/jpeg' if is_photo else 'audio/ogg'),
+                    config.PHOTO if is_photo else config.VOICE]
+    response = client.models.generate_content(
+        model=settings.AIConfig.MODEL_NAME,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level=settings.AIConfig.THINKING_LEVEL),
+            safety_settings=settings.AIConfig.SAFETY_SETTINGS,
+            http_options=types.HttpOptions(timeout=settings.VideoConfig.TIMEOUT_MS),
+            **extra,
+        ),
+    )
+    log_model_verdict(f"detail-{kind}", response)
+    return (response.text or "").strip()
+
+async def send_reply(chat_id, reply_to, text):
+    """ 그 /sum 명령에 답장으로 보냄 (HTML이 깨지면 태그를 걷어낸 글로) """
+    async with telegram.Bot(token=os.environ.get("TELEGRAM_TOKEN")) as bot:
+        reply = telegram.ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
+        try:
+            await bot.send_message(chat_id=chat_id, text=to_telegram_html(text), parse_mode='HTML', reply_parameters=reply)
+        except telegram.error.BadRequest:
+            await bot.send_message(chat_id=chat_id, text=strip_tags(text), reply_parameters=reply)
+
+def handle_detail(event):
+    """ 답장으로 부른 상세 읽기: 결과를 그 명령에 답장으로 보냄 """
+    try:
+        text = describe_in_detail(event)
+    except Exception as e:
+        print(f"Detail Error: {event.get('kind')}: {e}")
+        text = ""
+    status = 'done' if text else 'failed'
+    text = (text or "❌ 자세히 읽지 못했습니다.")[:settings.DetailConfig.REPLY_MAX_CHARS]
+    asyncio.run(send_reply(event['chat_id'], event['reply_to'], text))
+    return {'status': status}
+
+def get_clean_chat_history(chat_id, limit=100, since=None):
     """
     args:
         chat_id (int): 텔레그램 채팅 ID
         limit (int): 가져올 메시지 수
+        since (str): 이 시각(ISO, KST) 이후만 (답장한 지점부터 요약할 때)
     features:
         DynamoDB에서 메시지 히스토리를 가져오고 중복을 제거
     """
     try:
+        condition = Key('chat_id').eq(str(chat_id))
+        if since:
+            condition = condition & Key('timestamp').gte(since)
         # DB에서 여유있게 가져옴
         response = table.query(
-            KeyConditionExpression=Key('chat_id').eq(str(chat_id)),
+            KeyConditionExpression=condition,
             ScanIndexForward=False, # 최신순 조회
             Limit=int(limit * 1.5)
         )
@@ -323,10 +418,11 @@ def format_messages_to_xml(messages):
 
     return xml
 
-def format_header(messages):
+def format_header(messages, label="최근"):
     """
     args:
         messages (list): 시간순 메시지 딕셔너리 리스트
+        label (str): 범위 이름 ("최근", "답장한 지점부터" 등)
     features:
         요약 머리줄(메시지 수 + 시간 범위)을 코드에서 만듦 -> 모델이 날짜를 지어내지 않게 함
     """
@@ -338,7 +434,7 @@ def format_header(messages):
     first_day, first_time = short(messages[0]['timestamp'])
     last_day, last_time = short(messages[-1]['timestamp'])
     last = last_time if first_day == last_day else f"{last_day} {last_time}"
-    return f"📌 최근 {len(messages)}개 대화 · {first_day} {first_time} ~ {last}"
+    return f"📌 {label} {len(messages)}개 대화 · {first_day} {first_time} ~ {last}"
 
 def to_telegram_html(text):
     """
@@ -636,7 +732,11 @@ def more_buttons(limit):
     return InlineKeyboardMarkup([buttons]) if buttons else None
 
 async def handle_summary(update, context):
-    """ /sum 명령어 처리 """
+    """ /sum 명령어 처리 (메시지에 답장으로 치면 handle_reply_summary) """
+    if update.effective_message.reply_to_message:
+        await handle_reply_summary(update, context.bot)
+        return
+
     # 숫자 파싱 (/sum 50)
     limit = 100
     parts = update.effective_message.text.split()
@@ -644,6 +744,40 @@ async def handle_summary(update, context):
         limit = min(int(parts[1]), MAX_LIMIT)  # 안전장치
 
     await send_summary(context.bot, update.effective_chat.id, limit)
+
+async def handle_reply_summary(update, bot):
+    """
+    features:
+        답장으로 친 /sum
+        - 사진·음성에 답장 -> 자세한 설명·받아쓰기
+        - 링크가 든 메시지에 답장 -> 그 링크만 자세히 (유튜브는 영상, 그 밖은 페이지 본문)
+        - 그 밖의 메시지에 답장 -> 그 메시지부터 지금까지 요약
+        자세히 읽기는 오래 걸릴 수 있어 작업 함수가 처리해 그 명령에 답장으로 보냄
+    """
+    command = update.effective_message
+    target = command.reply_to_message
+    chat_id = update.effective_chat.id
+    base = {'task': 'detail', 'chat_id': chat_id, 'reply_to': command.message_id}
+
+    media = media_file(target)
+    if media:
+        if media['media_type'] == 'voice' and media.get('duration', 0) > settings.DetailConfig.VOICE_MAX_SECONDS:
+            await bot.send_message(chat_id=chat_id, text="5분이 넘는 음성은 받아 적지 않습니다.")
+            return
+        await bot.send_message(chat_id=chat_id, text="🔎 자세히 보고 있어요...")
+        invoke_worker({**base, 'kind': media['media_type'], 'file_id': media['file_id']})
+        return
+
+    links = [clean_url(u) for u in URL_PATTERN.findall(target.text or target.caption or "")]
+    if links:
+        await bot.send_message(chat_id=chat_id, text="🔎 링크를 자세히 읽고 있어요...")
+        invoke_worker({**base, 'kind': 'youtube' if youtube_ids(links[0]) else 'page', 'url': links[0]})
+        return
+
+    # 답장한 메시지 시각부터 (저장 시각은 보낸 시각보다 조금 늦으므로 2초 여유)
+    KST = timezone(timedelta(hours=9))
+    since = (target.date.astimezone(KST) - timedelta(seconds=2)).isoformat()
+    await send_summary(bot, chat_id, MAX_LIMIT, since=since)
 
 async def handle_more_button(update, bot):
     """ 요약 아래 [최근 N개로 다시] 버튼 처리 """
@@ -654,13 +788,18 @@ async def handle_more_button(update, bot):
     if data.startswith("sum:") and data[4:].isdigit():
         await send_summary(bot, query.message.chat.id, min(int(data[4:]), MAX_LIMIT))
 
-async def send_summary(bot, chat_id, limit):
-    """ 최근 limit개를 요약해 보냄 (명령어와 버튼이 함께 씀) """
+async def send_summary(bot, chat_id, limit, since=None):
+    """ 최근 limit개(since가 있으면 그 시각 이후, 최대 limit개)를 요약해 보냄 (명령어·버튼·답장이 함께 씀) """
     #TODO: 나중에 입력중으로 변경(입력중 + 안내 메시지)
-    await bot.send_message(chat_id=chat_id, text=f"🤖 최근 {limit}개의 대화 내용을 읽고 있어요...")
+    waiting = "🤖 답장한 메시지부터 대화를 읽고 있어요..." if since else f"🤖 최근 {limit}개의 대화 내용을 읽고 있어요..."
+    await bot.send_message(chat_id=chat_id, text=waiting)
 
     # DB 조회 -> 중복 제거 -> XML 변환
-    chat_history = get_clean_chat_history(chat_id, limit)
+    chat_history = get_clean_chat_history(chat_id, limit, since=since)
+    if since:
+        label = "답장한 지점 이후 최근" if len(chat_history) >= limit else "답장한 지점부터"
+    else:
+        label = "최근"
 
     if not chat_history:
         await bot.send_message(chat_id=chat_id, text="요약할 대화 내용이 없습니다.")
@@ -695,7 +834,7 @@ async def send_summary(bot, chat_id, limit):
         # 접힌 상세를 화제가 처음 나온 시간순으로 (최근이 아래)
         response_text = sort_details_by_time(response_text, chat_history[-1]['timestamp'])
 
-        header = format_header(chat_history)
+        header = format_header(chat_history, label)
         reply_markup = more_buttons(limit)
 
         # 안전장치
@@ -732,6 +871,7 @@ async def handle_about(update, context):
         "✨ <b>주요 기능</b>\n"
         "- <code>/sum</code>: 최근 100개 대화 요약 (<code>/sum 200</code>처럼 개수 지정, 최대 500)\n"
         "- 요약 아래 버튼으로 더 많은 대화를 다시 요약\n"
+        "- 메시지에 답장으로 <code>/sum</code>: 그 메시지부터 요약 (링크·사진·음성이면 그것만 자세히)\n"
         "- 사진·음성은 내용까지 읽고, 동영상·파일은 표식과 캡션으로 요약에 포함\n"
         "- 링크는 페이지 제목·설명을, 유튜브는 영상 요약까지 읽어 요약에 포함\n"
         "- 대화 자동 저장 및 7일 뒤 삭제 (TTL)\n\n"
@@ -851,7 +991,8 @@ async def main_logic(event, context):
                     user_name=user.first_name if user else (message.sender_chat.title if message.sender_chat else "알 수 없음"),
                     text=text,
                     message_date=message.date,
-                    media=media_file(message)
+                    media=media_file(message),
+                    user_id=user.id if user else (message.sender_chat.id if message.sender_chat else None)
                 )
                 # 사진·음성은 설명을, 유튜브 링크는 영상 요약을 미리 맡김 (작업 함수가 비동기로 처리)
                 request_media_description(item)
