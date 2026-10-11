@@ -171,6 +171,20 @@ def get_video_summaries(video_ids):
         print(f"Video Summary Query Error: {e}")
         return {}
 
+def log_model_verdict(where, response):
+    """ 모델의 종료 사유·안전 등급·차단 사유를 로그에 남김 (순화인지 차단인지 가리기 위함, 내용은 남기지 않음) """
+    try:
+        candidates = getattr(response, "candidates", None) or []
+        candidate = candidates[0] if candidates else None
+        finish = getattr(getattr(candidate, "finish_reason", None), "name", None)
+        ratings = [f"{r.category.name.replace('HARM_CATEGORY_', '')}:{r.probability.name}"
+                   for r in (getattr(candidate, "safety_ratings", None) or []) if r.category and r.probability]
+        feedback = getattr(response, "prompt_feedback", None)
+        block = getattr(getattr(feedback, "block_reason", None), "name", None)
+        print(f"Model Verdict [{where}] finish={finish} block={block} ratings={ratings}")
+    except Exception as e:
+        print(f"Model Verdict [{where}] unreadable: {e}")
+
 def media_worker_handler(event, context):
     """ 작업 함수 진입점 (요약 봇이 비동기로 호출): 유튜브 영상 요약 또는 사진·음성 설명 """
     if 'video_id' in event:
@@ -198,6 +212,7 @@ def describe_media_file(event):
                 http_options=types.HttpOptions(timeout=config.TIMEOUT_MS),
             ),
         )
+        log_model_verdict(event['media_type'], response)
         text = clip((response.text or "").strip(), config.TEXT_LENGTH)
         if not text:
             return {'status': 'failed'}
@@ -231,6 +246,7 @@ def summarize_video(video_id):
                 http_options=types.HttpOptions(timeout=config.TIMEOUT_MS),
             ),
         )
+        log_model_verdict("video", response)
         summary = (response.text or "").strip()
         item.update(status='done' if summary else 'failed', summary=clip(summary, config.SUMMARY_LENGTH),
                     ttl=int(time.time()) + config.TTL_DAYS * 24 * 60 * 60)
@@ -666,6 +682,7 @@ async def send_summary(bot, chat_id, limit):
             config=generate_config,
         )
 
+        log_model_verdict("summary", response)
         response_text = (response.text or "").strip()
 
         # 안전 필터 등으로 본문이 비어 오는 경우

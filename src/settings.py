@@ -4,7 +4,7 @@ from google.genai import types
 # 쓸 곳이 없어서 잠깐 적음
 GITHUB_URL = "https://github.com/ParkSangwook-bit/telegram-summarizer-bot"
 LAST_UPDATE = "2026-10-11"
-BOT_VERSION = "v1.6.1"
+BOT_VERSION = "v1.6.2"
 # =============================================
 
 
@@ -48,7 +48,8 @@ class MediaConfig:
     VOICE_LIMIT = 3            # 최근 음성 수
     VOICE_MAX_SECONDS = 60     # 이보다 긴 음성은 보내지 않음 (전처리도 같음)
     TOTAL_TIMEOUT = 5.0        # 텔레그램에서 받는 전체 시간 제한(초)
-    DESCRIBE_PHOTO = "이 사진에 무엇이 있는지 한국어 한 문장, 60자 이내로 적어라. 글자나 숫자가 보이면 핵심(이름·금액·날짜)을 넣어라."
+    DESCRIBE_PHOTO = ("이 사진에 무엇이 있는지 한국어 한 문장, 60자 이내로 적어라. 글자나 숫자가 보이면 핵심(이름·금액·날짜)을 넣어라. "
+                      "노출이 있으면 그 정도를 사실대로 짧게 적어라(예: 상반신 노출, 전신 노출). 속옷·수영복으로 바꿔 부르는 식으로 완곡하게 쓰지 말고, 성적인 묘사도 하지 마라.")
     DESCRIBE_VOICE = "이 음성을 한국어로 받아 적어라. 150자를 넘으면 핵심만 남겨 줄여라."
     TEXT_LENGTH = 150          # 저장할 설명·받아쓰기 최대 글자 수
     TIMEOUT_MS = 60_000        # 작업 함수에서 사진·음성 하나당 시간 제한
