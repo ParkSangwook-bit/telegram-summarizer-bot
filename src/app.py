@@ -132,9 +132,11 @@ def invoke_worker(payload):
     if worker:
         lambda_client.invoke(FunctionName=worker, InvocationType='Event', Payload=json.dumps(payload))
 
-def request_media_description(item):
-    """ 저장한 메시지가 사진·짧은 음성이면 설명·받아쓰기를 작업 함수에 맡김 """
+def request_media_description(item, media=None):
+    """ 저장한 메시지가 사진·짧은 음성이면 설명·받아쓰기를 작업 함수에 맡김 (방 설정에서 끈 종류는 건너뜀) """
     if not item or item.get('media_type') not in ('photo', 'voice'):
+        return
+    if media and not media.get(item['media_type'], True):
         return
     if item['media_type'] == 'voice' and int(item.get('duration', 0)) > settings.MediaConfig.VOICE_MAX_SECONDS:
         return
@@ -145,9 +147,9 @@ def youtube_ids(text):
     """ 글 속 유튜브 영상 ID (순서 유지, 중복 제거) """
     return list(dict.fromkeys(YOUTUBE_PATTERN.findall(text)))
 
-def request_video_summaries(text):
-    """ 글 속 유튜브 영상마다 요약을 한 번만 작업 함수에 맡김 """
-    if not os.environ.get("MEDIA_WORKER_FUNCTION"):
+def request_video_summaries(text, media=None):
+    """ 글 속 유튜브 영상마다 요약을 한 번만 작업 함수에 맡김 (방 설정에서 끄면 건너뜀) """
+    if not os.environ.get("MEDIA_WORKER_FUNCTION") or (media and not media.get('youtube', True)):
         return
     for video_id in youtube_ids(text):
         try:
@@ -502,14 +504,15 @@ def media_file(message):
         return {'media_type': 'voice', 'file_id': message.voice.file_id, 'duration': to_seconds(message.voice.duration)}
     return None
 
-def attach_media_text(messages):
-    """ 작업 함수가 미리 만든 사진 설명·음성 받아쓰기를 표식 뒤에 붙인 사본 """
-    return [dict(m, message=f"{m['message']} — 내용: {m['media_text']}") if m.get('media_text') else m for m in messages]
+def attach_media_text(messages, media=None):
+    """ 작업 함수가 미리 만든 사진 설명·음성 받아쓰기를 표식 뒤에 붙인 사본 (방 설정에서 끈 종류는 붙이지 않음) """
+    allowed = lambda m: not media or media.get(m.get('media_type'), True)
+    return [dict(m, message=f"{m['message']} — 내용: {m['media_text']}") if m.get('media_text') and allowed(m) else m for m in messages]
 
-def pick_media(messages):
+def pick_media(messages, media=None):
     """ 아직 설명이 없는(방금 올라와 처리 중이거나 실패한) 최근 사진·짧은 음성 몇 개 (시간순) """
     config = settings.MediaConfig
-    pending = [m for m in messages if not m.get('media_text')]
+    pending = [m for m in messages if not m.get('media_text') and (not media or media.get(m.get('media_type'), True))]
     photos = [m for m in pending if m.get('media_type') == 'photo'][-config.PHOTO_LIMIT:]
     voices = [m for m in pending if m.get('media_type') == 'voice' and int(m.get('duration', 0)) <= config.VOICE_MAX_SECONDS][-config.VOICE_LIMIT:]
     picked = {m['message_id'] for m in photos + voices}
@@ -719,6 +722,181 @@ def add_video_summaries(titles, links):
     return titles
 
 # ===============================================================
+# 방별 설정 (설정 페이지=텔레그램 미니앱에서 각 방 관리자가 바꿈)
+# ===============================================================
+
+SETTINGS_PARTITION = 'CHAT_SETTINGS'  # 방 설정 (대화 파티션에 두면 최신순 조회에 섞이므로 따로)
+STATE_PARTITION = 'CHAT_STATE'        # 지난 요약 시각
+_settings_cache = {}
+_prompt_cache = {}
+
+def default_chat_settings():
+    c = settings.ChatConfig
+    return {'tone': c.TONE[0], 'vocab': c.VOCAB[0], 'focus': c.FOCUS[0], 'detail_lines': c.DETAIL_LINES[0],
+            'expanded': False, 'default_range': c.DEFAULT_RANGE[0], 'media': {k: True for k in c.MEDIA_KEYS},
+            'excluded_ids': set(), 'version': 0}
+
+def clean_chat_settings(raw):
+    """ 저장값을 허용 목록으로 다시 검증 (모르는 값·깨진 값은 기본값) """
+    c = settings.ChatConfig
+    cfg = default_chat_settings()
+    if not raw:
+        return cfg
+    for key, allowed in (('tone', c.TONE), ('vocab', c.VOCAB), ('focus', c.FOCUS), ('default_range', c.DEFAULT_RANGE)):
+        if raw.get(key) in allowed:
+            cfg[key] = raw[key]
+    # 항목마다 따로 검증 (하나가 깨져도 제외 목록은 반드시 읽음)
+    try:
+        if int(raw.get('detail_lines', c.DETAIL_LINES[0])) in c.DETAIL_LINES:
+            cfg['detail_lines'] = int(raw.get('detail_lines', c.DETAIL_LINES[0]))
+    except (TypeError, ValueError):
+        pass
+    for x in (raw.get('excluded_ids') or set()):
+        try:
+            cfg['excluded_ids'].add(int(x))
+        except (TypeError, ValueError):
+            pass
+    try:
+        cfg['version'] = int(raw.get('version', 0))
+    except (TypeError, ValueError):
+        pass
+    if isinstance(raw.get('expanded'), bool):
+        cfg['expanded'] = raw['expanded']
+    media = raw.get('media') if isinstance(raw.get('media'), dict) else {}
+    cfg['media'] = {k: media.get(k, True) is not False for k in c.MEDIA_KEYS}
+    return cfg
+
+def get_chat_settings(chat_id, fresh=False):
+    """ 방 설정 (60초 캐시). 설정이 없거나 읽기 실패면 기본값 = 지금 동작 """
+    key = str(chat_id)
+    hit = _settings_cache.get(key)
+    if hit and not fresh and hit[0] > time.time():
+        return hit[1]
+    try:
+        item = table.get_item(Key={'chat_id': SETTINGS_PARTITION, 'timestamp': key}).get('Item')
+    except Exception as e:
+        print(f"Settings Read Error: {e}")
+        item = None
+    cfg = clean_chat_settings(item)
+    _settings_cache[key] = (time.time() + settings.ChatConfig.CACHE_SECONDS, cfg)
+    return cfg
+
+def build_system_prompt(cfg):
+    """ 기본 프롬프트(실측한 그대로) + 기본값이 아닌 설정만 <chat_style>로 덧붙임 (관리자가 쓴 글자는 넣지 않음) """
+    c = settings.ChatConfig
+    lines = []
+    for key, defaults in (('tone', c.TONE), ('vocab', c.VOCAB), ('focus', c.FOCUS)):
+        if cfg[key] != defaults[0]:
+            lines.append(c.STYLE[key][cfg[key]])
+    if cfg['detail_lines'] not in (c.DETAIL_LINES[0], 0):
+        n = cfg['detail_lines']
+        lines.append(f"- Detail block: at most {n} lines instead of 5 (the {n} most important subjects). List them most important first, "
+                     f"not oldest first: the system keeps the first {n} and then sorts them by time.")
+    base = settings.PromptConfig.SYSTEM_TEMPLATE
+    if not lines:
+        return base
+    key = tuple(lines)
+    if key not in _prompt_cache:
+        style = "  <chat_style>\n    " + c.STYLE_HEADER + "\n    " + "\n    ".join(lines) + "\n  </chat_style>\n"
+        end = base.rindex("</system_instruction>")
+        _prompt_cache[key] = base[:end] + style + base[end:]
+    return _prompt_cache[key]
+
+def shape_output(text, cfg):
+    """
+    설정에 따라 모양만 바꿈 (시간순 정렬 전에 부름): 한 줄 결론만이면 접힌 상세를 빼고,
+    줄 수를 바꾼 방은 앞에서부터 그 줄 수만 남김 (모델이 줄 수 지시를 자주 넘겨서, 중요한 순으로 쓰게 하고 코드로 자름)
+    """
+    n = cfg['detail_lines']
+    if n == 0:
+        return re.sub(r"\s*<blockquote expandable>.*?</blockquote>", "", text, flags=re.S)
+    if n == settings.ChatConfig.DETAIL_LINES[0]:
+        return text
+    block = re.search(r"(<blockquote expandable>)(.*?)(</blockquote>)", text, re.S)
+    if not block:
+        return text
+    lines = [l.strip() for l in block.group(2).strip().splitlines() if l.strip()]
+    return text[:block.start()] + block.group(1) + "\n".join(lines[:n]) + block.group(3) + text[block.end():]
+
+def get_last_summary_time(chat_id):
+    try:
+        item = table.get_item(Key={'chat_id': STATE_PARTITION, 'timestamp': str(chat_id)}).get('Item') or {}
+        return item.get('last_summary_at')
+    except Exception as e:
+        print(f"State Read Error: {e}")
+        return None
+
+def save_summary_time(chat_id, when):
+    try:
+        table.put_item(Item={'chat_id': STATE_PARTITION, 'timestamp': str(chat_id), 'message_id': 0, 'last_summary_at': when})
+    except Exception as e:
+        print(f"State Save Error: {e}")
+
+def set_opt_out(chat_id, user_id, on):
+    """ 멤버 본인의 제외 켜고 끄기 (관리자 설정 저장과 부딪히지 않게 ADD/DELETE만) """
+    table.update_item(
+        Key={'chat_id': SETTINGS_PARTITION, 'timestamp': str(chat_id)},
+        UpdateExpression=('ADD' if on else 'DELETE') + ' excluded_ids :u',
+        ExpressionAttributeValues={':u': {int(user_id)}},
+    )
+    _settings_cache.pop(str(chat_id), None)
+
+def delete_user_messages(chat_id, user_id):
+    """ 그 멤버가 남긴 저장 메시지를 지움 (보낸 사람 번호가 기록된 것만: v1.8.0 이후 저장분) """
+    from boto3.dynamodb.conditions import Attr
+    deleted, start = 0, None
+    with table.batch_writer() as batch:
+        while True:
+            kwargs = {'KeyConditionExpression': Key('chat_id').eq(str(chat_id)),
+                      'FilterExpression': Attr('user_id').eq(int(user_id)), 'ProjectionExpression': 'chat_id, #ts',
+                      'ExpressionAttributeNames': {'#ts': 'timestamp'}}
+            if start:
+                kwargs['ExclusiveStartKey'] = start
+            page = table.query(**kwargs)
+            for item in page.get('Items', []):
+                batch.delete_item(Key={'chat_id': item['chat_id'], 'timestamp': item['timestamp']})
+                deleted += 1
+            start = page.get('LastEvaluatedKey')
+            if not start:
+                return deleted
+
+def make_chat_token(chat_id, now=None):
+    """ 설정 링크에 실을 방 토큰: "방번호_만료_서명" (startapp 허용 문자 A-Za-z0-9_- 만 씀) """
+    expires = int((now or time.time()) + settings.ChatConfig.TOKEN_HOURS * 3600)
+    body = f"{chat_id}_{expires}"
+    sign = hmac.new(os.environ.get("TELEGRAM_TOKEN", "").encode(), b"chat-settings:" + body.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{body}_{sign}"
+
+def verify_chat_token(token, now=None):
+    """ 방 토큰 확인. 맞으면 방 번호(int), 틀리거나 만료면 None """
+    try:
+        chat_id, expires, sign = token.rsplit("_", 2)
+        body = f"{int(chat_id)}_{int(expires)}"
+    except (AttributeError, ValueError):
+        return None
+    good = hmac.new(os.environ.get("TELEGRAM_TOKEN", "").encode(), b"chat-settings:" + body.encode(), hashlib.sha256).hexdigest()[:32]
+    if not sign.isascii() or not hmac.compare_digest(sign, good) or int(expires) < (now or time.time()):
+        return None
+    return int(chat_id)
+
+def verify_init_data(init_data, max_age=86400, now=None):
+    """ 텔레그램 미니앱 initData 서명 확인 (secret = HMAC_SHA256(key="WebAppData", msg=봇 토큰)). 맞으면 user dict """
+    from urllib.parse import parse_qsl
+    pairs = dict(parse_qsl(init_data or "", keep_blank_values=True))
+    received = pairs.pop('hash', '')
+    check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret = hmac.new(b"WebAppData", os.environ.get("TELEGRAM_TOKEN", "").encode(), hashlib.sha256).digest()
+    if not received or not hmac.compare_digest(hmac.new(secret, check.encode(), hashlib.sha256).hexdigest(), received):
+        return None
+    try:
+        if (now or time.time()) - int(pairs.get('auth_date', 0)) > max_age:
+            return None
+        user = json.loads(pairs.get('user') or '{}')
+    except ValueError:
+        return None
+    return user if user.get('id') else None
+
+# ===============================================================
 # 핸들러 함수 (Command Handlers)
 # ===============================================================
 
@@ -737,13 +915,22 @@ async def handle_summary(update, context):
         await handle_reply_summary(update, context.bot)
         return
 
+    chat_id = update.effective_chat.id
     # 숫자 파싱 (/sum 50)
-    limit = 100
     parts = update.effective_message.text.split()
     if len(parts) > 1 and parts[1].isdigit():
-        limit = min(int(parts[1]), MAX_LIMIT)  # 안전장치
+        await send_summary(context.bot, chat_id, min(int(parts[1]), MAX_LIMIT))  # 안전장치
+        return
 
-    await send_summary(context.bot, update.effective_chat.id, limit)
+    # 숫자가 없으면 방 설정의 기본 범위 (지난 요약이 없으면 100개)
+    default_range = get_chat_settings(chat_id)['default_range']
+    if default_range == 'since_last':
+        last = get_last_summary_time(chat_id)
+        if last:
+            await send_summary(context.bot, chat_id, MAX_LIMIT, since=last, since_kind='last')
+            return
+        default_range = '100'
+    await send_summary(context.bot, chat_id, int(default_range))
 
 async def handle_reply_summary(update, bot):
     """
@@ -752,15 +939,20 @@ async def handle_reply_summary(update, bot):
         - 사진·음성에 답장 -> 자세한 설명·받아쓰기
         - 링크가 든 메시지에 답장 -> 그 링크만 자세히 (유튜브는 영상, 그 밖은 페이지 본문)
         - 그 밖의 메시지에 답장 -> 그 메시지부터 지금까지 요약
-        자세히 읽기는 오래 걸릴 수 있어 작업 함수가 처리해 그 명령에 답장으로 보냄
+        자세히 읽기는 오래 걸릴 수 있어 작업 함수가 처리해 그 명령에 답장으로 보냄 (방 설정에서 끈 종류는 거절)
     """
     command = update.effective_message
     target = command.reply_to_message
     chat_id = update.effective_chat.id
     base = {'task': 'detail', 'chat_id': chat_id, 'reply_to': command.message_id}
+    media_on = get_chat_settings(chat_id)['media']
 
     media = media_file(target)
     if media:
+        name = '사진' if media['media_type'] == 'photo' else '음성'
+        if not media_on.get(media['media_type'], True):
+            await bot.send_message(chat_id=chat_id, text=f"이 방은 {name} 읽기가 꺼져 있습니다.")
+            return
         if media['media_type'] == 'voice' and media.get('duration', 0) > settings.DetailConfig.VOICE_MAX_SECONDS:
             await bot.send_message(chat_id=chat_id, text="5분이 넘는 음성은 받아 적지 않습니다.")
             return
@@ -770,8 +962,12 @@ async def handle_reply_summary(update, bot):
 
     links = [clean_url(u) for u in URL_PATTERN.findall(target.text or target.caption or "")]
     if links:
+        kind = 'youtube' if youtube_ids(links[0]) else 'page'
+        if not media_on.get('youtube' if kind == 'youtube' else 'link', True):
+            await bot.send_message(chat_id=chat_id, text=f"이 방은 {'유튜브' if kind == 'youtube' else '링크'} 읽기가 꺼져 있습니다.")
+            return
         await bot.send_message(chat_id=chat_id, text="🔎 링크를 자세히 읽고 있어요...")
-        invoke_worker({**base, 'kind': 'youtube' if youtube_ids(links[0]) else 'page', 'url': links[0]})
+        invoke_worker({**base, 'kind': kind, 'url': links[0]})
         return
 
     # 답장한 메시지 시각부터 (저장 시각은 보낸 시각보다 조금 늦으므로 2초 여유)
@@ -788,39 +984,52 @@ async def handle_more_button(update, bot):
     if data.startswith("sum:") and data[4:].isdigit():
         await send_summary(bot, query.message.chat.id, min(int(data[4:]), MAX_LIMIT))
 
-async def send_summary(bot, chat_id, limit, since=None):
-    """ 최근 limit개(since가 있으면 그 시각 이후, 최대 limit개)를 요약해 보냄 (명령어·버튼·답장이 함께 씀) """
+# since가 있을 때 머리줄·안내문: (범위 안 전부, 최대 개수에 걸려 최근만, 읽는 중 안내)
+SINCE_LABELS = {
+    'reply': ("답장한 지점부터", "답장한 지점 이후 최근", "답장한 메시지부터"),
+    'last': ("지난 요약 이후", "지난 요약 이후 최근", "지난 요약 이후"),
+}
+
+async def send_summary(bot, chat_id, limit, since=None, since_kind='reply'):
+    """ 최근 limit개(since가 있으면 그 시각 이후, 최대 limit개)를 방 설정대로 요약해 보냄 (명령어·버튼·답장이 함께 씀) """
+    cfg = get_chat_settings(chat_id)
+    labels = SINCE_LABELS[since_kind] if since else None
     #TODO: 나중에 입력중으로 변경(입력중 + 안내 메시지)
-    waiting = "🤖 답장한 메시지부터 대화를 읽고 있어요..." if since else f"🤖 최근 {limit}개의 대화 내용을 읽고 있어요..."
+    waiting = f"🤖 {labels[2]} 대화를 읽고 있어요..." if since else f"🤖 최근 {limit}개의 대화 내용을 읽고 있어요..."
     await bot.send_message(chat_id=chat_id, text=waiting)
 
-    # DB 조회 -> 중복 제거 -> XML 변환
+    # DB 조회 -> 중복 제거 -> 제외를 켠 멤버의 메시지 빼기 -> XML 변환
     chat_history = get_clean_chat_history(chat_id, limit, since=since)
-    if since:
-        label = "답장한 지점 이후 최근" if len(chat_history) >= limit else "답장한 지점부터"
-    else:
-        label = "최근"
+    if cfg['excluded_ids']:
+        chat_history = [m for m in chat_history if m.get('user_id') is None or int(m['user_id']) not in cfg['excluded_ids']]
+    label = (labels[1] if len(chat_history) >= limit else labels[0]) if since else "최근"
 
     if not chat_history:
         await bot.send_message(chat_id=chat_id, text="요약할 대화 내용이 없습니다.")
         return
 
-    # 링크 제목·설명과 사진·음성을 동시에 가져옴 (실패해도 요약은 진행)
+    # 링크 제목·설명과 사진·음성을 동시에 가져옴 (방 설정에서 끈 종류는 건너뜀, 실패해도 요약은 진행)
+    media_on = cfg['media']
     links = recent_links(chat_history, settings.LinkConfig.LIMIT)
-    titles, downloaded = await asyncio.gather(fetch_link_titles(links), download_media(bot, pick_media(chat_history)))
-    titles = add_video_summaries(titles, links)  # 유튜브는 미리 만들어 둔 영상 요약도 덧붙임
+    titles, downloaded = await asyncio.gather(fetch_link_titles(links if media_on['link'] else []),
+                                              download_media(bot, pick_media(chat_history, media_on)))
+    if media_on['youtube']:
+        titles = add_video_summaries(titles, links)  # 유튜브는 미리 만들어 둔 영상 요약도 덧붙임
     # 사진·음성은 미리 만든 설명을 붙이고, 아직 설명이 없는 것만 파일을 직접 첨부
-    messages, media_parts = attach_media(attach_link_titles(attach_media_text(chat_history), titles), downloaded)
+    messages, media_parts = attach_media(attach_link_titles(attach_media_text(chat_history, media_on), titles), downloaded)
     xml_data = format_messages_to_xml(messages)
 
     # AI 호출
     try:
+        # 방 설정(말투·어휘·초점·줄 수)이 기본값이 아니면 프롬프트 끝에 <chat_style>을 덧붙임
+        prompt = build_system_prompt(cfg)
+        config = generate_config if prompt is settings.PromptConfig.SYSTEM_TEMPLATE else generate_config.model_copy(update={'system_instruction': prompt})
 
         # AI에게 요약 생성 요청 (대화 XML 뒤에 번호 붙은 사진·음성)
         response = client.models.generate_content(
             model=settings.AIConfig.MODEL_NAME,
             contents=[xml_data, *media_parts],
-            config=generate_config,
+            config=config,
         )
 
         log_model_verdict("summary", response)
@@ -831,8 +1040,11 @@ async def send_summary(bot, chat_id, limit, since=None):
             await bot.send_message(chat_id=chat_id, text="❌ 요약을 만들지 못했습니다. 잠시 뒤 다시 시도해 주세요.")
             return
 
-        # 접힌 상세를 화제가 처음 나온 시간순으로 (최근이 아래)
-        response_text = sort_details_by_time(response_text, chat_history[-1]['timestamp'])
+        # 방 설정대로 줄 수를 맞춘 뒤(한 줄 결론만이면 상세를 뺌), 접힌 상세를 화제가 처음 나온 시간순으로 (최근이 아래)
+        response_text = sort_details_by_time(shape_output(response_text, cfg), chat_history[-1]['timestamp'])
+        body_html = to_telegram_html(response_text)
+        if cfg['expanded']:
+            body_html = body_html.replace("<blockquote expandable>", "<blockquote>")
 
         header = format_header(chat_history, label)
         reply_markup = more_buttons(limit)
@@ -842,7 +1054,7 @@ async def send_summary(bot, chat_id, limit, since=None):
             # HTML 모드로 전송
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"{html.escape(header)}\n\n{to_telegram_html(response_text)}",
+                text=f"{html.escape(header)}\n\n{body_html}",
                 parse_mode='HTML',
                 reply_markup=reply_markup,
             )
@@ -855,9 +1067,44 @@ async def send_summary(bot, chat_id, limit, since=None):
                 reply_markup=reply_markup,
             )
 
+        # '지난 요약 이후' 범위의 기준점
+        save_summary_time(chat_id, datetime.now(timezone(timedelta(hours=9))).isoformat())
+
     except Exception as e:
         # AI 생성 실패 or 네트워크 오류 등 기타 치명적 에러
         await bot.send_message(chat_id=chat_id, text=f"❌ 시스템 오류: {e}")
+
+async def handle_settings_command(update, context):
+    """ /settings: 이 방의 설정 페이지(텔레그램 미니앱) 링크를 보냄 """
+    chat = update.effective_chat
+    if chat.type == 'private':
+        await context.bot.send_message(chat_id=chat.id, text="설정은 요약 봇이 있는 단톡방에서 /settings 로 여세요.")
+        return
+    link = f"https://t.me/{context.bot.username}/{settings.ChatConfig.MINIAPP_SHORT_NAME}?startapp={make_chat_token(chat.id)}"
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text="⚙️ 이 방의 요약 설정입니다. 관리자는 말투·범위·읽기 설정을 바꿀 수 있고, 누구나 '내 메시지 제외'를 켤 수 있어요. (링크는 24시간 유효)",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ 설정 열기", url=link)]]),
+    )
+
+async def handle_opt_out(update, context):
+    """ /optout: 이 방에서 내 메시지를 저장·요약하지 않음 (이미 저장된 내 메시지도 지움) """
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type == 'private' or not user:
+        await context.bot.send_message(chat_id=chat.id, text="단톡방에서 쳐 주세요.")
+        return
+    set_opt_out(chat.id, user.id, True)
+    deleted = delete_user_messages(chat.id, user.id)
+    await context.bot.send_message(chat_id=chat.id, text=f"✅ 이제 이 방에서 내 메시지는 저장·요약하지 않아요. 저장돼 있던 {deleted}개도 지웠어요. 되돌리려면 /optin")
+
+async def handle_opt_in(update, context):
+    """ /optin: 내 메시지 제외를 끔 """
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type == 'private' or not user:
+        await context.bot.send_message(chat_id=chat.id, text="단톡방에서 쳐 주세요.")
+        return
+    set_opt_out(chat.id, user.id, False)
+    await context.bot.send_message(chat_id=chat.id, text="✅ 다시 이 방의 요약에 내 메시지를 포함해요.")
 
 async def handle_about(update, context):
     """ /about 명령어: 봇 정보와 버튼 출력 """
@@ -872,6 +1119,8 @@ async def handle_about(update, context):
         "- <code>/sum</code>: 최근 100개 대화 요약 (<code>/sum 200</code>처럼 개수 지정, 최대 500)\n"
         "- 요약 아래 버튼으로 더 많은 대화를 다시 요약\n"
         "- 메시지에 답장으로 <code>/sum</code>: 그 메시지부터 요약 (링크·사진·음성이면 그것만 자세히)\n"
+        "- <code>/settings</code>: 이 방의 요약 설정 (관리자는 말투·범위·읽기 설정, 누구나 내 메시지 제외)\n"
+        "- <code>/optout</code>·<code>/optin</code>: 내 메시지를 이 방에서 저장·요약하지 않기 / 되돌리기\n"
         "- 사진·음성은 내용까지 읽고, 동영상·파일은 표식과 캡션으로 요약에 포함\n"
         "- 링크는 페이지 제목·설명을, 유튜브는 영상 요약까지 읽어 요약에 포함\n"
         "- 대화 자동 저장 및 7일 뒤 삭제 (TTL)\n\n"
@@ -918,6 +1167,9 @@ COMMAND_HANDLERS = {
     "/sum": handle_summary,
     "/summary": handle_summary,  # 예전 안내 문구(/summary)로 들어오는 경우
     "/about": handle_about,
+    "/settings": handle_settings_command,
+    "/optout": handle_opt_out,
+    "/optin": handle_opt_in,
     # "/help": handle_help,
     }
 
@@ -984,6 +1236,11 @@ async def main_logic(event, context):
                 
             # 일반 대화는 저장
             else:
+                cfg = get_chat_settings(chat_id)
+                sender_id = user.id if user else (message.sender_chat.id if message.sender_chat else None)
+                # 본인이 제외를 켠 멤버의 메시지는 아예 저장하지 않음
+                if sender_id is not None and sender_id in cfg['excluded_ids']:
+                    return {"statusCode": 200, "body": "Opted out"}
                 item = save_message_to_db(
                     chat_id=chat_id,
                     message_id=message.message_id,
@@ -992,17 +1249,137 @@ async def main_logic(event, context):
                     text=text,
                     message_date=message.date,
                     media=media_file(message),
-                    user_id=user.id if user else (message.sender_chat.id if message.sender_chat else None)
+                    user_id=sender_id
                 )
-                # 사진·음성은 설명을, 유튜브 링크는 영상 요약을 미리 맡김 (작업 함수가 비동기로 처리)
-                request_media_description(item)
-                request_video_summaries(text)
+                # 사진·음성은 설명을, 유튜브 링크는 영상 요약을 미리 맡김 (작업 함수가 비동기로 처리, 방 설정에서 끈 종류는 건너뜀)
+                request_media_description(item, cfg['media'])
+                request_video_summaries(text, cfg['media'])
 
         except Exception as e:
             print(f"Error: {e}")
             return {"statusCode": 200, "body": str(e)}
 
     return {"statusCode": 200, "body": "OK"}
+
+# ===============================================================
+# 설정 페이지 (텔레그램 미니앱): GET /settings = 페이지, /settings/api = 읽기·저장
+# ===============================================================
+
+SETTINGS_PAGE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings_page.html")
+
+def json_response(status, data):
+    return {"statusCode": status, "headers": {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"},
+            "body": json.dumps(data, ensure_ascii=False)}
+
+def validate_changes(raw):
+    """ 관리자가 보낸 설정을 엄격히 검증 (모르는 키·허용 밖 값이 하나라도 있으면 None) """
+    c = settings.ChatConfig
+    allowed = {'tone': c.TONE, 'vocab': c.VOCAB, 'focus': c.FOCUS, 'detail_lines': c.DETAIL_LINES, 'default_range': c.DEFAULT_RANGE}
+    if not isinstance(raw, dict) or not raw or set(raw) - set(allowed) - {'expanded', 'media'}:
+        return None
+    clean = {}
+    for key, value in raw.items():
+        if key == 'expanded':
+            if not isinstance(value, bool):
+                return None
+        elif key == 'media':
+            if not isinstance(value, dict) or set(value) != set(c.MEDIA_KEYS) or not all(isinstance(v, bool) for v in value.values()):
+                return None
+        elif isinstance(value, bool) or value not in allowed[key]:
+            return None
+        clean[key] = value
+    return clean
+
+def save_chat_settings(chat_id, changes, version, user_id):
+    """ 관리자 설정 저장. 판 번호(version)가 그대로일 때만 (동시 수정 충돌 방지). 제외 목록은 건드리지 않음 """
+    names, values, sets = {'#version': 'version'}, {':v': int(version), ':n': int(version) + 1, ':by': int(user_id),
+                                                    ':at': datetime.now(timezone.utc).isoformat(), ':zero': 0}, []
+    for i, (key, value) in enumerate(changes.items()):
+        names[f'#k{i}'] = key
+        values[f':v{i}'] = value
+        sets.append(f'#k{i} = :v{i}')
+    table.update_item(
+        Key={'chat_id': SETTINGS_PARTITION, 'timestamp': str(chat_id)},
+        UpdateExpression='SET ' + ', '.join(sets + ['#version = :n', 'updated_by = :by', 'updated_at = :at', 'message_id = :zero']),
+        ConditionExpression='attribute_not_exists(#version) OR #version = :v',
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+    _settings_cache.pop(str(chat_id), None)
+
+def public_settings(cfg):
+    """ 페이지에 보낼 설정 (제외한 멤버는 누구인지 빼고 인원만) """
+    view = {k: cfg[k] for k in ('tone', 'vocab', 'focus', 'detail_lines', 'expanded', 'default_range', 'media', 'version')}
+    view['excluded_count'] = len(cfg['excluded_ids'])
+    return view
+
+async def settings_api(event):
+    """ 설정 읽기·저장. 텔레그램 서명(initData)으로 누구인지, 방 토큰으로 어느 방인지, getChatMember로 권한 확인 """
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    auth = headers.get("authorization") or ""
+    user = verify_init_data(auth[4:] if auth.startswith("tma ") else "")
+    if not user:
+        return json_response(401, {"error": "텔레그램 안에서 열어 주세요."})
+    method = event.get("httpMethod", "GET")
+    body = {}
+    if method == "POST":
+        if len(event.get("body") or "") > 4096:
+            return json_response(400, {"error": "요청이 너무 커요."})
+        try:
+            body = json.loads(event.get("body") or "{}")
+        except ValueError:
+            return json_response(400, {"error": "잘못된 요청이에요."})
+    token = body.get("t") if method == "POST" else (event.get("queryStringParameters") or {}).get("t")
+    chat_id = verify_chat_token(token or "")
+    if chat_id is None:
+        return json_response(403, {"error": "링크가 만료됐어요. 단톡방에서 /settings 를 다시 쳐 주세요."})
+
+    async with telegram.Bot(token=os.environ.get("TELEGRAM_TOKEN")) as bot:
+        try:
+            member = await bot.get_chat_member(chat_id, user['id'])
+            chat = await bot.get_chat(chat_id)
+        except telegram.error.TelegramError:
+            return json_response(403, {"error": "이 방의 멤버가 아니에요."})
+    is_admin = member.status in ("creator", "administrator")
+    if not is_admin and member.status not in ("member", "restricted"):
+        return json_response(403, {"error": "이 방의 멤버가 아니에요."})
+
+    deleted = None
+    if method == "POST":
+        action = body.get("action")
+        if action == "optout" and isinstance(body.get("value"), bool):
+            set_opt_out(chat_id, user['id'], body["value"])
+            deleted = delete_user_messages(chat_id, user['id']) if body["value"] else 0
+        elif action == "save":
+            if not is_admin:
+                return json_response(403, {"error": "설정은 관리자만 바꿀 수 있어요."})
+            changes = validate_changes(body.get("settings"))
+            if changes is None or not isinstance(body.get("version"), int):
+                return json_response(400, {"error": "허용되지 않는 값이 있어요."})
+            try:
+                save_chat_settings(chat_id, changes, body["version"], user['id'])
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                    return json_response(409, {"error": "다른 관리자가 먼저 바꿨어요. 새로 불러올게요."})
+                raise
+        else:
+            return json_response(400, {"error": "잘못된 요청이에요."})
+
+    cfg = get_chat_settings(chat_id, fresh=True)
+    return json_response(200, {"chat_title": chat.title, "is_admin": is_admin, "settings": public_settings(cfg),
+                               "me": {"opted_out": int(user['id']) in cfg['excluded_ids']}, "deleted": deleted})
+
+def handle_settings_http(event):
+    """ GET /settings -> 설정 페이지 HTML, /settings/api -> 읽기·저장 """
+    if event.get("resource") == "/settings":
+        with open(SETTINGS_PAGE_PATH, encoding="utf-8") as f:
+            page = f.read()
+        return {"statusCode": 200, "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}, "body": page}
+    try:
+        return asyncio.run(settings_api(event))
+    except Exception as e:
+        print(f"Settings API Error: {e}")
+        return json_response(500, {"error": "잠시 뒤 다시 시도해 주세요."})
 
 def webhook_secret():
     """ 웹훅 비밀 토큰 = 봇 토큰에서 유도 (따로 보관할 비밀이 늘지 않음, setWebhook의 secret_token과 같은 값) """
@@ -1014,6 +1391,9 @@ def is_from_telegram(event):
     return hmac.compare_digest(headers.get("x-telegram-bot-api-secret-token") or "", webhook_secret())
 
 def lambda_handler(event, context):
+    # 설정 페이지·API는 미니앱 서명(initData)으로 따로 확인
+    if (event.get("resource") or "").startswith("/settings"):
+        return handle_settings_http(event)
     # 텔레그램이 아닌 곳에서 온 요청(위조 업데이트)은 처리하지 않음
     if not is_from_telegram(event):
         print("Rejected: missing or wrong webhook secret")

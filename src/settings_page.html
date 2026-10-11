@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>요약 봇 설정</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#fff);--fg:var(--tg-theme-text-color,#1d1d1f);--hint:var(--tg-theme-hint-color,#8a8a8f);
+--accent:var(--tg-theme-button-color,#2f80ed);--accent-fg:var(--tg-theme-button-text-color,#fff);--card:var(--tg-theme-secondary-bg-color,#f2f2f5)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,"Malgun Gothic","Apple SD Gothic Neo",sans-serif;padding:16px 16px 96px;word-break:keep-all;overflow-wrap:anywhere}
+h1{font-size:20px;margin:4px 0 2px}
+.sub{color:var(--hint);font-size:14px;margin-bottom:12px}
+#msg{color:var(--hint);font-size:14px;min-height:20px;margin:0 0 10px}
+section{background:var(--card);border-radius:14px;padding:14px 14px 4px;margin-bottom:14px}
+h2{font-size:14px;margin:0 0 10px;color:var(--hint);font-weight:600}
+.row{margin-bottom:14px}
+.label{font-weight:600;margin-bottom:6px}
+.help{color:var(--hint);font-size:13px;line-height:1.5}
+.seg{display:flex;flex-wrap:wrap;gap:6px}
+.seg button{border:1.5px solid var(--hint);background:transparent;color:var(--fg);border-radius:10px;padding:7px 12px;font-size:15px}
+.seg button.on{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+.tog{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 0 10px}
+.tog input{width:44px;height:24px;flex:none;accent-color:var(--accent)}
+.ro .seg button{pointer-events:none;opacity:.75}
+#save{position:fixed;left:16px;right:16px;bottom:16px;border:0;border-radius:12px;padding:14px;font-size:17px;font-weight:700;background:var(--accent);color:var(--accent-fg)}
+#save:disabled{opacity:.45}
+</style>
+</head>
+<body>
+<h1 id="title">요약 봇 설정</h1>
+<div class="sub" id="role"></div>
+<div id="msg">불러오는 중…</div>
+
+<section id="mine" hidden>
+  <h2>내 설정</h2>
+  <div class="tog">
+    <div><div class="label">내 메시지 제외</div>
+      <div class="help">켜면 이 방에서 내 메시지를 저장·요약하지 않고, 저장돼 있던 내 메시지도 지워요(예전 일부 제외, 7일 뒤엔 모두 사라짐). 관리자에게는 인원만 보여요.</div></div>
+    <input type="checkbox" id="optout" aria-label="내 메시지 제외">
+  </div>
+</section>
+
+<div id="admin" hidden>
+  <section>
+    <h2>말투와 어휘</h2>
+    <div class="row"><div class="label">말투</div><div class="seg" data-key="tone"></div></div>
+    <div class="row"><div class="label">어휘</div><div class="seg" data-key="vocab"></div></div>
+  </section>
+  <section>
+    <h2>무엇을, 얼마나</h2>
+    <div class="row"><div class="label">요약 초점</div><div class="seg" data-key="focus"></div></div>
+    <div class="row"><div class="label">상세 분량</div><div class="seg" data-key="detail_lines"></div>
+      <div class="tog"><span>상세를 펼친 채로 보내기</span><input type="checkbox" data-bool="expanded" aria-label="상세를 펼친 채로 보내기"></div></div>
+    <div class="row"><div class="label">기본 범위 <span class="help">(숫자 없이 /sum)</span></div><div class="seg" data-key="default_range"></div></div>
+  </section>
+  <section>
+    <h2>읽기</h2>
+    <div class="tog"><span>사진 내용</span><input type="checkbox" data-media="photo" aria-label="사진 내용"></div>
+    <div class="tog"><span>음성 받아쓰기</span><input type="checkbox" data-media="voice" aria-label="음성 받아쓰기"></div>
+    <div class="tog"><span>유튜브 영상 요약</span><input type="checkbox" data-media="youtube" aria-label="유튜브 영상 요약"></div>
+    <div class="tog"><span>링크 제목</span><input type="checkbox" data-media="link" aria-label="링크 제목"></div>
+    <div class="help" id="excluded" style="padding-bottom:10px"></div>
+  </section>
+</div>
+<button id="save" hidden disabled>저장</button>
+
+<script>
+const OPTIONS = {
+  tone: [["bullet", "개조식"], ["polite", "짧은 존댓말"], ["casual", "반말"]],
+  vocab: [["original", "원문 그대로"], ["easy", "쉬운 말"]],
+  focus: [["auto", "자동"], ["chat", "수다"], ["study", "스터디·정보"], ["work", "업무"]],
+  detail_lines: [[0, "한 줄만"], [3, "3줄"], [5, "5줄"], [7, "7줄"]],
+  default_range: [["50", "50개"], ["100", "100개"], ["200", "200개"], ["since_last", "지난 요약 이후"]],
+};
+const tg = window.Telegram && window.Telegram.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const initData = tg ? tg.initData : "";
+const token = (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) || new URLSearchParams(location.search).get("t") || "";
+const $ = (s) => document.querySelector(s);
+let state = null, draft = null;
+
+function msg(text) { $("#msg").textContent = text || ""; }
+function editable(s) {
+  return { tone: s.tone, vocab: s.vocab, focus: s.focus, detail_lines: s.detail_lines,
+           expanded: s.expanded, default_range: s.default_range, media: s.media };
+}
+async function api(method, body) {
+  // 페이지 주소(…/Prod/settings, 끝 슬래시 있어도)에서 API 주소를 만듦
+  const base = location.pathname.replace(/\/settings\/?$/, "/settings/api");
+  const url = base + (method === "GET" ? "?t=" + encodeURIComponent(token) : "");
+  const res = await fetch(url, {
+    method, headers: { "Authorization": "tma " + initData, "Content-Type": "application/json" },
+    body: method === "POST" ? JSON.stringify(Object.assign({ t: token }, body)) : undefined,
+  });
+  const data = await res.json().catch(() => ({ error: "응답을 읽지 못했어요." }));
+  if (!res.ok) throw Object.assign(new Error(data.error || "오류가 났어요."), { status: res.status });
+  return data;
+}
+function render() {
+  $("#title").textContent = state.chat_title || "요약 봇 설정";
+  $("#role").textContent = state.is_admin ? "관리자 · 이 방의 요약 설정을 바꿀 수 있어요" : "멤버 · 요약 설정은 관리자만 바꿀 수 있어요";
+  $("#mine").hidden = false;
+  $("#admin").hidden = false;
+  $("#admin").classList.toggle("ro", !state.is_admin);
+  $("#optout").checked = state.me.opted_out;
+  document.querySelectorAll(".seg").forEach((el) => {
+    const key = el.dataset.key;
+    el.innerHTML = "";
+    OPTIONS[key].forEach(([value, label]) => {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.className = draft[key] === value ? "on" : "";
+      b.onclick = () => { draft[key] = value; render(); };
+      el.appendChild(b);
+    });
+  });
+  document.querySelectorAll("[data-bool]").forEach((el) => {
+    el.checked = !!draft[el.dataset.bool];
+    el.disabled = !state.is_admin;
+    el.onchange = () => { draft[el.dataset.bool] = el.checked; render(); };
+  });
+  document.querySelectorAll("[data-media]").forEach((el) => {
+    el.checked = !!draft.media[el.dataset.media];
+    el.disabled = !state.is_admin;
+    el.onchange = () => { draft.media[el.dataset.media] = el.checked; render(); };
+  });
+  $("#excluded").textContent = "'내 메시지 제외'를 켠 멤버: " + state.settings.excluded_count + "명";
+  $("#save").hidden = !state.is_admin;
+  $("#save").disabled = JSON.stringify(editable(draft)) === JSON.stringify(editable(state.settings));
+}
+function load(data) { state = data; draft = JSON.parse(JSON.stringify(data.settings)); render(); }
+async function init() {
+  if (!initData) { msg("텔레그램 안에서 열어 주세요. 단톡방에서 /settings 를 치면 링크가 와요."); return; }
+  try { load(await api("GET")); msg(""); } catch (e) { msg(e.message); }
+}
+$("#save").onclick = async () => {
+  $("#save").disabled = true;
+  msg("저장하는 중…");
+  try {
+    load(await api("POST", { action: "save", settings: editable(draft), version: state.settings.version }));
+    msg("저장했어요. 1분 안에 요약에 반영돼요.");
+  } catch (e) {
+    msg(e.message);
+    if (e.status === 409) init(); else render();
+  }
+};
+$("#optout").onchange = async (ev) => {
+  const on = ev.target.checked;
+  msg(on ? "제외하는 중…" : "되돌리는 중…");
+  try {
+    const data = await api("POST", { action: "optout", value: on });
+    load(data);
+    msg(on ? "제외했어요. 저장돼 있던 내 메시지 " + (data.deleted || 0) + "개를 지웠어요." : "다시 요약에 포함해요.");
+  } catch (e) { ev.target.checked = !on; msg(e.message); }
+};
+init();
+</script>
+</body>
+</html>

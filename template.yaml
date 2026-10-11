@@ -59,6 +59,19 @@ Resources:
             Method: post
             # "암시적" API ->"명시적" API로 변경
             RestApiId: !Ref SummarizerApi
+        # 설정 페이지 (텔레그램 미니앱): 페이지와 그 API. 인증은 미니앱 서명(initData)으로 함수가 직접 확인
+        SettingsPage:
+          Type: Api
+          Properties:
+            Path: /settings
+            Method: get
+            RestApiId: !Ref SummarizerApi
+        SettingsApi:
+          Type: Api
+          Properties:
+            Path: /settings/api
+            Method: any
+            RestApiId: !Ref SummarizerApi
 
       # 함수 DynamoDB 테이블 접근 권한 부여.
       Policies:
@@ -117,3 +130,6 @@ Outputs:
   SummarizerFunctionApi:
     Description: "API Gateway endpoint URL for Prod stage"
     Value: !Sub "https://${SummarizerApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/bot"
+  SettingsPageUrl:
+    Description: "Web App URL for BotFather /newapp (per-chat settings Mini App)"
+    Value: !Sub "https://${SummarizerApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/settings"

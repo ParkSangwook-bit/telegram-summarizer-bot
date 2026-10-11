@@ -24,6 +24,8 @@ _[작동 영상 추가 예정]_
 - 링크 읽기: 요약할 때 최근 링크 10개의 페이지 제목·설명(유튜브는 제목·채널)을 가져와 맥락에 넣습니다. 공개 주소의 80·443 포트만 열고, 내부 주소는 막습니다.
 - 사진·음성 읽기: 사진과 1분 이하 음성이 올라오면 작업 함수가 설명·받아쓰기를 만들어 그 메시지에 저장하고, 요약은 이를 씁니다. 아직 처리 중인 최근 것(사진 5장·음성 3개)은 요약할 때 직접 첨부합니다.
 - 유튜브 미리 요약: 유튜브 링크가 올라오면 작업 함수(`MediaWorkerFunction`)가 비동기로 영상을 요약해 DynamoDB에 저장하고, `/sum`은 저장된 요약을 꺼내 씁니다(공개 영상, 앞 20분).
+- 방별 설정(`/settings`): 텔레그램 미니앱 설정 페이지에서 방 관리자가 말투(개조식·짧은 존댓말·반말), 어휘(원문·쉬운 말), 요약 초점(자동·수다·스터디·업무), 상세 분량(한 줄만·3·5·7줄, 펼친 채로), 기본 범위(50·100·200개·지난 요약 이후), 사진·음성·유튜브·링크 읽기를 고릅니다. 기본값은 지금 동작 그대로이고, 모델·온도·자유 지시문은 열지 않습니다.
+- 내 메시지 제외(`/optout`, `/optin`): 멤버 본인만 켤 수 있고, 켜면 그 방에서 내 메시지를 저장·요약하지 않으며 저장돼 있던 것도 지웁니다. 관리자에게는 인원만 보입니다.
 - UI/UX: 대기 메시지 및 에러 발생 시 사용자 알림 기능을 제공함.
 - AWS Lambda의 서버리스 프리티어와 gemini api를 통해서 유지비용 최소화
 
@@ -146,6 +148,9 @@ SECRET=$(python -c "import hmac,hashlib;print(hmac.new(b'[TOKEN]',b'telegram-web
 curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook" -d "url=[API_GATEWAY_URL]" -d "secret_token=$SECRET" -d "drop_pending_updates=true"
 ```
 
+### 5. 설정 페이지 연결 (Mini App)
+BotFather에서 `/newapp`으로 봇에 미니앱을 만들고, Web App URL은 API 주소의 `/bot`을 `/settings`로 바꾼 값, 짧은 이름은 `settings`(`ChatConfig.MINIAPP_SHORT_NAME`)로 정합니다. 단톡방에서 `/settings`를 치면 24시간 유효한 링크 버튼이 오고, 페이지는 텔레그램 서명(initData)과 방 토큰, 관리자 여부를 확인합니다.
+
 ***
 
 ## 📅 로드맵 (Roadmap)
@@ -162,3 +167,4 @@ curl -X POST "https://api.telegram.org/bot[TOKEN]/setWebhook" -d "url=[API_GATEW
 - [x] v1.6.2: 사진 설명에서 노출 정도를 완곡하게 바꾸지 않음, 모델 판정 로그
 - [x] v1.7.0: 웹훅 비밀 토큰 검사(위조 업데이트 거절)
 - [x] v1.8.0: 답장 /sum(그 지점부터 요약 · 링크/사진/음성 상세), 보낸 사람 번호 저장
+- [x] v1.9.0: 방별 설정 페이지(텔레그램 미니앱, 관리자만), 내 메시지 제외(/optout·/optin)
